@@ -72,7 +72,7 @@ Verified:
 - Offline: all 100 `.toc` files re-encode byte-for-byte; unchanged bundles rebuild byte-for-byte; `restore` returns byte-identical files (`node fb2_repack.js --game "<game dir>" selftest`).
 - **In the game:** replacing a res inside bundles works. The texture headers of every livery of the Chevrolet Camaro SS (1967) were swapped in 17 rebuilt bundles in `ShippingVehicles.sb`. In a race the car lost its camo livery, and after `restore` the livery came back. (Garage previews are pre-rendered images and do not change.)
 - **In the game:** PNG texture import works. A test pattern imported with `fb2_tex_import.js` into the Camaro SS (1967) liveries showed on the car in a race. In the garage the 3D car showed it for a moment and then switched back, probably because the garage also loads data from official patch delta bundles.
-- Most menu, UI and level bundles are replaced by official patch delta bundles, which are not supported yet.
+- **In the game:** patching official delta bundles works. The Chevrolet garage logo header was swapped for the Dodge one in 26 delta bundles (menu, game config, every level), and the garage showed the Dodge logo for Chevrolet.
 
 ## Official patch delta bundles
 
