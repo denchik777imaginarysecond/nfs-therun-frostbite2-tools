@@ -74,6 +74,17 @@ Verified:
 - **In the game:** PNG texture import works. A test pattern imported with `fb2_tex_import.js` into the Camaro SS (1967) liveries showed on the car in a race. In the garage the 3D car showed it for a moment and then switched back, probably because the garage also loads data from official patch delta bundles.
 - **In the game:** patching official delta bundles works. The Chevrolet garage logo header was swapped for the Dodge one in 26 delta bundles (menu, game config, every level), and the garage showed the Dodge logo for Chevrolet.
 
+## Recipe: unlock the developer menu (Free Roam)
+
+The main menu has a hidden item `ID_MENU_DEBUG` (in `_c4/ui/flow/screen/menu_mainmenu`). Selecting it opens `FrontEndDevGraph`: Start Free Roam, Chapter Select, Stage Select and more. In the retail game the item is hidden by a visibility condition. This makes it always visible, like the other items:
+
+```bash
+node fb2_ebx_edit.js --game "<game dir>" set _c4/ui/flow/screen/menu_mainmenu 5.Visibility.DataCategory=null 5.Visibility.DataKey=0 5.Visibility.InvertValue=false
+node fb2_patch.js --game "<game dir>" apply      # as administrator; undo with: restore
+```
+
+**Verified in the game:** the item appears in the main menu, the developer menu opens, and Free Roam lets you drive freely around the map. The developer menu was made for internal builds, so some entries may not work in retail.
+
 ## Official patch delta bundles
 
 A patch bundle with `delta=true` is an assembly list, not a binary diff:
@@ -107,7 +118,7 @@ Notes on the format, as found in this game: EBX header fields are 32-bit (unlike
 ## Findings
 
 - **`Level_1200_BlackCanyon`** is a cut level. The audio bundle registry lists 24 levels: the 23 shipped ones plus Black Canyon, which sits between `1100_MillionDollar` and `1300_IndependencePass`. Only its sound bundle remains (a construction digger sound). There is no level data and no text for it.
-- A **developer main menu** (`frontenddevgraph`) with *Start Free Roam*, *Free Roam Online*, Chapter/Stage Select and test screens.
+- A **developer main menu** (`frontenddevgraph`) with *Start Free Roam*, *Free Roam Online*, Chapter/Stage Select and test screens. **It can be unlocked in the retail game, and Free Roam works** (see the recipe above).
 - A **debug menu** (max speed, infinite health, jump cheat, no collision, teleport), an **unlock-all menu** and **QA tools**. They are wired into the retail menus behind switches. Whether they work in retail has not been tested.
 - **Demo and E3 leftovers**: demo menus, Japanese demo screens, `e3_pause`, the "demo expired" screen.
 - Working names of shipped tracks: `deathvalley`, `panamintsprings`, `zioncanyon`, `yosemitenorth`.
