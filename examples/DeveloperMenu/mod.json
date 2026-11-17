@@ -1,0 +1,19 @@
+{
+  "format": 1,
+  "name": "Developer Menu",
+  "version": "1.0.0",
+  "author": "denchik777imaginarysecond",
+  "description": "Shows the hidden DEBUG item in the main menu: the developers' menu with Start Free Roam, Chapter Select, Stage Select and more.",
+  "changes": [
+    {
+      "type": "ebx",
+      "asset": "_c4/ui/flow/screen/menu_mainmenu",
+      "where": { "Label": "ID_MENU_DEBUG" },
+      "set": {
+        "Visibility.DataCategory": null,
+        "Visibility.DataKey": 0,
+        "Visibility.InvertValue": false
+      }
+    }
+  ]
+}

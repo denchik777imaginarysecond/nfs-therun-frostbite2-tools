@@ -74,7 +74,7 @@ function writeValue(buf, parsed, at, kind, text) {
   }
 }
 
-module.exports = { readAsGameSees };
+module.exports = { readAsGameSees, resolve, writeValue };
 
 if (require.main === module) {
   const args = L.OPTS.rest;

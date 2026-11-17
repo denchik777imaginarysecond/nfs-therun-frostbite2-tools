@@ -43,6 +43,16 @@ Close the game and double-click **`disable_devmenu.bat`**. It restores every cha
 | Something in the developer menu crashes or does nothing | The menu was made for internal builds; not every entry works in the retail game. Free Roam does |
 | Driving physics feels odd in places | Free Roam was a developer test mode; the game is also built for 30 FPS, and higher frame rates are known to affect its physics |
 
+### Installing other mods
+
+Mods come as **`.nfsmod`** files. They hold no game files, only a description of the changes, which are applied to your own game.
+
+- **Install:** drag a `.nfsmod` file onto **`install_mod.bat`**. It is installed, enabled, and all enabled mods are applied together.
+- **Undo everything:** **`restore_game.bat`** puts the original game files back. Installed mods stay, and **`apply_mods.bat`** applies them again.
+- **Manage** (in a terminal in the tool's folder): `node fb2_mods.js list`, `enable <id>`, `disable <id>`, `remove <id>`, then `apply_mods.bat`. `node fb2_mods.js check` shows conflicts without changing anything.
+
+The developer menu itself is a mod too (`examples/DeveloperMenu`); `enable_devmenu.bat` / `disable_devmenu.bat` just switch it on or off together with your other mods.
+
 ---
 
 ## For researchers and modders
@@ -80,7 +90,46 @@ node fb2_texture.js --game "<game dir>" garage/preview
 node fb2_ebx_edit.js --game "<game dir>" show _c4/ui/flow/screen/menu_mainmenu
 ```
 
-### Modding
+### Making a mod (.nfsmod)
+
+A mod is a folder (or a ZIP renamed to `.nfsmod`) with a `mod.json` and optional PNG files:
+
+```json
+{
+  "format": 1,
+  "name": "Developer Menu",
+  "version": "1.0.0",
+  "author": "you",
+  "description": "What the mod does",
+  "changes": [
+    { "type": "ebx", "asset": "_c4/ui/flow/screen/menu_mainmenu",
+      "where": { "Label": "ID_MENU_DEBUG" },
+      "set": { "Visibility.DataCategory": null, "Visibility.DataKey": 0, "Visibility.InvertValue": false } },
+    { "type": "texture", "asset": "_c4/vehicles/nfs/che_cam_ss_67/vinyls/che_cam_ss_67_rare_texture_win32", "png": "my_livery.png" },
+    { "type": "file", "kind": "res", "name": "<asset name>", "path": "files/asset.res" }
+  ]
+}
+```
+
+| Change | What it does |
+|---|---|
+| `ebx` | Sets values (bool, numbers, enums by name, `null` references) in an ebx. `where` picks the instance whose fields have the given values (more robust than an index); `"instance": n` also works; add `"all": true` to change every match. Paths go into structs with dots: `Visibility.InvertValue`. |
+| `texture` | Replaces a texture with a PNG (resized to the texture's size; DXT1/DXT5 textures). |
+| `file` | Replaces a whole ebx/res/chunk with a file from the mod (advanced; avoid shipping original game data). |
+
+Find assets and values with `node fb2_extract.js --game "<game dir>" find <word>` and `node fb2_ebx_edit.js --game "<game dir>" show <ebx>`.
+
+```bash
+node fb2_mods.js new "My Mod"                 # creates my-mod/mod.json
+node fb2_mods.js install my-mod               # install the folder while developing
+node fb2_mods.js check                        # resolve every change, show conflicts
+node fb2_mods.js apply --dry-run              # show what would be patched
+node fb2_mods.js pack my-mod                  # -> my-mod-1.0.0.nfsmod to share
+```
+
+Mods are applied in load order (`list`); when two mods set the same value, the later one wins and `check`/`apply` report the conflict. `apply` always restores the original files first and then applies all enabled mods together.
+
+### Modding (low level)
 
 `fb2_patch.js` applies mods from a `mods/` folder. Mod files hold the **unpacked** asset data:
 
@@ -144,7 +193,11 @@ The bundle is all segments concatenated in order. Source `0` = the next bytes of
 | File | What it does |
 |---|---|
 | `enable_devmenu.bat`, `disable_devmenu.bat` | One-click developer menu unlock / undo (ask for administrator rights) |
-| `fb2_devmenu.js` | The logic behind them: `enable`, `disable`, `status` |
+| `install_mod.bat`, `apply_mods.bat`, `restore_game.bat` | Install a dropped `.nfsmod`, apply enabled mods, restore the original game (ask for administrator rights) |
+| `fb2_mods.js` | Mod manager: `.nfsmod` format, install/enable/disable/remove, conflict check, apply, pack |
+| `fb2_zip.js` | Minimal ZIP reader/writer for `.nfsmod` |
+| `examples/DeveloperMenu` | The developer menu unlock as a mod |
+| `fb2_devmenu.js` | The logic behind them: switches the DeveloperMenu mod on/off through the mod manager |
 | `fb2_extract.js` | TOC decryption, DbObject parser, bundle headers, zlib block decompression, asset index and extraction |
 | `fb2_ebx.js` | EBX header parser: type names, GUID, imports, string table |
 | `fb2_ebx_fields.js` | Full ebx field reader: every instance and value (structs, arrays, enums, references), with the byte offset of each value. Parses all 91,715 ebx of the game |

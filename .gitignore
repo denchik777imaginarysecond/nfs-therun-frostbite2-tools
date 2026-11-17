@@ -54,3 +54,6 @@ desktop.ini
 mods/
 *.bak
 fb2_patch_state.json
+
+# --- Packed mods (share them via releases, not the repo) ---
+*.nfsmod
