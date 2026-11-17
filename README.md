@@ -8,7 +8,7 @@ Tools for **Need for Speed: The Run** (PC, Frostbite 2). They unlock the game's 
 
 ## Unlock Free Roam (for players)
 
-The retail game still contains the developers' main menu entry **DEBUG**. It opens a developer menu with **Start Free Roam**, Chapter Select, Stage Select and more. It is only hidden. This tool makes it visible. Nothing is downloaded or added from outside: it changes one visibility flag in your own game files, keeps backups, and can undo everything.
+The retail game still contains the developers' main menu entry **DEBUG**. It opens a developer menu with **Start Free Roam**, Chapter Select, Stage Select and more. It is only hidden. This tool makes it visible. Nothing is downloaded from outside, and **your game files are not changed**: the tool writes one visibility flag into a separate folder, `Update\Mods`, which the game loads on top of its official patch. Deleting that folder undoes everything.
 
 ### You need
 
@@ -18,7 +18,7 @@ The retail game still contains the developers' main menu entry **DEBUG**. It ope
 
 ### Install
 
-1. **Download** [nfs-therun-frostbite2-tools-1.0.0.zip](https://github.com/denchik777imaginarysecond/nfs-therun-frostbite2-tools/archive/refs/tags/v1.0.0.zip) (or the green **Code → Download ZIP** button for the latest version).
+1. **Download** [nfs-therun-frostbite2-tools-1.1.0.zip](https://github.com/denchik777imaginarysecond/nfs-therun-frostbite2-tools/archive/refs/tags/v1.1.0.zip) (or the green **Code → Download ZIP** button for the latest version).
 2. **Unzip** it anywhere, for example to your Desktop. Not inside the game folder.
 3. **Close the game.** Double-click **`enable_devmenu.bat`** and click **Yes** when Windows asks for administrator rights. The game sits in `Program Files`, so the tool needs them to change its files.
 4. Wait for **Done** in the window, then press any key.
@@ -28,9 +28,9 @@ The first run takes a few seconds longer and keeps about 300 MB of index data in
 
 ### Undo
 
-Close the game and double-click **`disable_devmenu.bat`**. It restores every changed file byte for byte.
+Close the game and double-click **`disable_devmenu.bat`**. It removes the `Update\Mods` folder (or rebuilds it with your other mods), and the game runs with its original files. Deleting `Update\Mods` by hand does the same.
 
-**Undo before you update or repair the game** (EA app / Origin). A repair restores the original files anyway, so afterwards you can simply run `enable_devmenu.bat` again.
+If you used version 1.0.0 of this tool (it changed the game files directly), the new version undoes that automatically the first time it runs. After a repair of the game in EA app / Origin, just run `enable_devmenu.bat` (or `apply_mods.bat`) again if the menu is gone.
 
 ### Problems
 
@@ -48,7 +48,7 @@ Close the game and double-click **`disable_devmenu.bat`**. It restores every cha
 Mods come as **`.nfsmod`** files. They hold no game files, only a description of the changes, which are applied to your own game.
 
 - **Install:** drag a `.nfsmod` file onto **`install_mod.bat`**. It is installed, enabled, and all enabled mods are applied together.
-- **Undo everything:** **`restore_game.bat`** puts the original game files back. Installed mods stay, and **`apply_mods.bat`** applies them again.
+- **Undo everything:** **`restore_game.bat`** removes `Update\Mods`, so the game runs with its original files. Installed mods stay, and **`apply_mods.bat`** applies them again.
 - **Manage** (in a terminal in the tool's folder): `node fb2_mods.js list`, `enable <id>`, `disable <id>`, `remove <id>`, then `apply_mods.bat`. `node fb2_mods.js check` shows conflicts without changing anything.
 
 The developer menu itself is a mod too (`examples/DeveloperMenu`); `enable_devmenu.bat` / `disable_devmenu.bat` just switch it on or off together with your other mods.
@@ -127,7 +127,7 @@ node fb2_mods.js apply --dry-run              # show what would be patched
 node fb2_mods.js pack my-mod                  # -> my-mod-1.0.0.nfsmod to share
 ```
 
-Mods are applied in load order (`list`); when two mods set the same value, the later one wins and `check`/`apply` report the conflict. `apply` always restores the original files first and then applies all enabled mods together.
+Mods are applied in load order (`list`); when two mods set the same value, the later one wins and `check`/`apply` report the conflict. `apply` builds all enabled mods together into one update package, `<game>\Update\Mods`: a copy of the official patch (about 45 MB) with the changes added and a version number one above the patch, so the game loads it instead of `Update\Patch`. The original game files are never written. Bundles that the patch takes from the base game are added to the package as delta bundles that reference the base `.sb`, so only changed data is stored. Not supported yet: assets in superbundles that the official patch does not touch (audio, terrain, CommonAssets, Globals).
 
 ### Modding (low level)
 
@@ -208,7 +208,7 @@ The bundle is all segments concatenated in order. Source `0` = the next bytes of
 | `fb2_texture.js` | Texture header parser and DXT decoder, writes PNG |
 | `fb2_tex_import.js` | PNG to DXT1/DXT5 texture import: resize, mip levels, writes a chunk mod |
 | `fb2_repack.js` | Write support: lossless DbObject/TOC writer, zlib block packer, `.sb` append, bundle rebuild, delta bundles, self-test |
-| `fb2_patch.js` | Mod loader: `apply`, `restore`, `status`, with backups |
+| `fb2_patch.js` | Mod loader: `apply --package <dir>` builds the `Update\Mods` package; the older in-place mode (`apply`/`restore` with backups) is kept for migration and research |
 
 Notes on the format, as found in this game: EBX header fields are 32-bit (unlike Battlefield 3). On PC, ebx instances are `[GUID][data]` packed with at most 4-byte alignment. Chunk GUIDs in bundle tables have their first three fields byte-swapped. Video and audio chunks are stored uncompressed.
 
@@ -226,7 +226,7 @@ Made by **denchik777imaginarysecond** (u/Imaginary-Second9581 on Reddit). The re
 
 ## Disclaimer
 
-Not affiliated with Electronic Arts or Black Box. Need for Speed and The Run are trademarks of their respective owners. This project contains no game assets. It changes files of your own game installation; it keeps backups and can undo its changes, but use it at your own risk.
+Not affiliated with Electronic Arts or Black Box. Need for Speed and The Run are trademarks of their respective owners. This project contains no game assets. It adds a folder to your own game installation (`Update\Mods`) and does not change the original game files, but use it at your own risk.
 
 ## License
 

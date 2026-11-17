@@ -9,8 +9,8 @@
  *   node fb2_mods.js install <file.nfsmod|folder>
  *   node fb2_mods.js enable <id> | disable <id> | remove <id>
  *   node fb2_mods.js check                     resolve every change against the game, report conflicts (writes nothing)
- *   node fb2_mods.js apply [--dry-run]         restore the game, then apply all enabled mods together (administrator)
- *   node fb2_mods.js restore                   undo every change (administrator)
+ *   node fb2_mods.js apply [--dry-run]         build all enabled mods into <game>/Update/Mods (administrator)
+ *   node fb2_mods.js restore                   remove Update/Mods: the game runs with its original files (administrator)
  *   node fb2_mods.js new "<name>"              create a mod folder with a mod.json template
  *   node fb2_mods.js pack <folder> [out.nfsmod]
  * Options: --game "<game dir>" (found automatically in the usual folders), --mods <dir> (default: ./mods)
@@ -24,6 +24,8 @@
  *       { "type": "file", "kind": "ebx|res|chunk", "name": "<asset name or chunk guid>", "path": "<file in the mod>" } ] }
  * "where" picks the instance whose fields equal the given values (e.g. { "Label": "ID_MENU_DEBUG" } or { "$type": "..." }).
  * Mods are applied in load order (list); when two mods change the same value, the later one wins and a conflict is reported.
+ * The game files are never changed: mods are written into an extra update package <game>/Update/Mods (a copy of the
+ * official patch with the changes, and a higher version number), which the game loads instead of Update/Patch.
  */
 const fs = require('fs');
 const path = require('path');
@@ -57,6 +59,7 @@ function loadGame() {
 }
 const runPatch = (...a) => spawnSync(process.execPath, ['--max-old-space-size=8192', path.join(TOOL, 'fb2_patch.js'), '--game', GAME, '--out', OUT, ...a], { stdio: 'inherit' }).status === 0;
 const gamePatched = () => fs.existsSync(path.join(GAME, 'fb2_patch_state.json'));
+const PKG_DIR = () => path.join(GAME, 'Update', 'Mods'); // our update package, loaded by the game on top of the official patch
 
 // ------------------------------------------------------------------ mods on disk
 const slug = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'mod';
@@ -194,17 +197,33 @@ function check() {
   const r = build(false);
   console.log(`${r.enabled.length} enabled mod(s), ${r.count} change(s): all resolved against the game.`);
   if (r.conflicts.length) { console.log('Conflicts:'); r.conflicts.forEach((c) => console.log('  - ' + c)); } else console.log('No conflicts.');
-  if (gamePatched()) console.log('(The game is currently patched; values were read from the patched files.)');
+  if (gamePatched()) console.log('(The game files are patched in place by an older version of this tool; values were read from the patched files.)');
+}
+// Older versions patched the game files in place; undo that first so the package is built from the original files.
+function undoInPlace() {
+  if (!gamePatched()) return;
+  console.log('Restoring game files patched by an older version of this tool...');
+  if (!runPatch('restore')) throw new Error('restore failed');
 }
 function apply() {
   loadGame();
-  if (!DRY && gamePatched()) { console.log('Restoring the original game files first...'); if (!runPatch('restore')) throw new Error('restore failed'); }
+  if (!DRY) undoInPlace();
   const r = build(true);
   r.conflicts.forEach((c) => console.log('  CONFLICT: ' + c));
-  if (!r.enabled.length) { console.log('No enabled mods: the game is in its original state.'); return; }
+  if (!r.enabled.length) {
+    if (!DRY && !runPatch('remove-package', '--package', PKG_DIR())) throw new Error('could not remove the mod package');
+    console.log('No enabled mods: the game runs with its original files.');
+    return;
+  }
   console.log(`Applying ${r.enabled.length} mod(s): ${r.enabled.join(', ')}`);
-  if (!runPatch('apply', '--mods', r.outDir, ...(DRY ? ['--dry-run'] : []))) throw new Error('fb2_patch failed');
+  // mods go into a separate update package (Update/Mods); the game's own files are never changed
+  if (!runPatch('apply', '--mods', r.outDir, '--package', PKG_DIR(), ...(DRY ? ['--dry-run'] : []))) throw new Error('fb2_patch failed');
   if (!DRY) console.log('Done. Start the game. Undo everything with: restore');
+}
+function restoreAll() {
+  loadGame();
+  undoInPlace();
+  if (!runPatch('remove-package', '--package', PKG_DIR())) throw new Error('could not remove the mod package');
 }
 function newMod(name) {
   if (!name) throw new Error('usage: new "<mod name>"');
@@ -228,7 +247,7 @@ function pack(dir, out) {
   console.log(`Packed "${m.name}" (${files.length} file(s)) -> ${target}`);
 }
 
-try {
+if (require.main === module) try {
   if (cmd === 'list') list();
   else if (cmd === 'install') { install(rest[0]); }
   else if (cmd === 'enable') setEnabled(rest[0], true);
@@ -236,7 +255,7 @@ try {
   else if (cmd === 'remove') { const l = loadList(); if (!l.order.includes(rest[0])) throw new Error('not installed: ' + rest[0]); fs.rmSync(path.join(MODS, rest[0]), { recursive: true, force: true }); delete l.enabled[rest[0]]; saveList(l); console.log(`Removed ${rest[0]}. Run "apply" to update the game.`); }
   else if (cmd === 'check') check();
   else if (cmd === 'apply') apply();
-  else if (cmd === 'restore') { loadGame(); process.exit(runPatch('restore') ? 0 : 1); }
+  else if (cmd === 'restore') restoreAll();
   else if (cmd === 'new') newMod(rest[0]);
   else if (cmd === 'pack') pack(rest[0], rest[1]);
   else console.log('Commands: list | install <file|folder> | enable <id> | disable <id> | remove <id> | check | apply [--dry-run] | restore | new "<name>" | pack <folder> [out]');

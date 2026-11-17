@@ -311,7 +311,18 @@ function encodeDelta(newBuf, copies, oldMap, oldInline) {
 
 // Applies replacements to a delta bundle; returns the new delta bytes (to append to the patch .sb).
 function rebuildDeltaBundle(patchSbFile, offset, size, baseSbFile, commonFile, replaceByName) {
-  const delta = readDelta(patchSbFile, offset, size);
+  return rebuildFromDelta(readDelta(patchSbFile, offset, size), baseSbFile, commonFile, replaceByName);
+}
+
+// Same for a bundle the patch does not change (flag "base"): it is treated as a delta made of one
+// segment "whole bundle from the base .sb", so the result references the base file for unchanged data
+// and holds only the replaced entries inline.
+function rebuildBaseAsDelta(baseSbFile, offset, size, commonFile, replaceByName) {
+  const delta = { segs: [{ size, src: 1, off: offset }], inline: Buffer.alloc(0) };
+  return rebuildFromDelta(delta, baseSbFile, commonFile, replaceByName);
+}
+
+function rebuildFromDelta(delta, baseSbFile, commonFile, replaceByName) {
   const old = reconstructDelta(delta, baseSbFile, commonFile);
   return withTempFile(old.buf, (fd) => {
     const info = L.readBundle(fd, 0, old.buf.length);
@@ -330,7 +341,7 @@ function rebuildDeltaBundle(patchSbFile, offset, size, baseSbFile, commonFile, r
 module.exports = {
   dbRead, dbWrite, child, numOf, setNum, strOf, readTocFile, encodeToc, tocChunks, tocBundles, entryId, entryFlag,
   packBlocks, isBlockFramed, appendToSb, rebuildBundle, bundleLayout,
-  readDelta, reconstructDelta, encodeDelta, rebuildDeltaBundle, withTempFile, DELTA_MAGIC,
+  readDelta, reconstructDelta, encodeDelta, rebuildDeltaBundle, rebuildBaseAsDelta, withTempFile, DELTA_MAGIC,
 };
 
 // ============================================================ self-test ===

@@ -5,6 +5,8 @@
  *   node fb2_patch.js --game "<game dir>" apply   [--mods ./mods] [--dry-run]
  *   node fb2_patch.js --game "<game dir>" restore
  *   node fb2_patch.js --game "<game dir>" status  [--mods ./mods]
+ *   node fb2_patch.js --game "<game dir>" apply --package "<game dir>/Update/Mods"   build an update package instead (game files untouched)
+ *   node fb2_patch.js --game "<game dir>" remove-package --package "<game dir>/Update/Mods"
  *
  * mods/ layout (data is the UNPACKED asset, as produced by the extract tools):
  *   mods/chunk/<32-hex guid>.chunk          replaces a chunk (in a .toc chunk list or inside a bundle)
@@ -39,6 +41,11 @@ const flag = (f) => args.includes(f);
 const optVal = (f, d) => { const i = args.indexOf(f); return i >= 0 ? args[i + 1] : d; };
 const MODS = path.resolve(optVal('--mods', 'mods'));
 const DRY = flag('--dry-run');
+// Package mode (--package <dir>, normally <game>/Update/Mods): the game files are never written.
+// The official patch is copied to <dir>.new, the mods are applied to that copy, and it becomes an extra
+// update package with a higher version than the patch, which the game loads instead of Update/Patch.
+const PKG = optVal('--package', null) ? path.resolve(optVal('--package')) : null;
+let PD = PATCH_DATA; // the patch data that is read and modified: the game's own patch, or the package copy
 
 const rel = (f) => path.relative(GAME, f);
 const sha1 = (b) => crypto.createHash('sha1').update(b).digest('hex');
@@ -50,6 +57,7 @@ function loadState() { return fs.existsSync(STATE_FILE) ? JSON.parse(fs.readFile
 function saveState(s) { fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 1)); }
 
 function protectToc(state, file) {
+  if (PKG) return; // package mode only writes to its own copy: nothing to back up
   const k = rel(file);
   if (state.files[k]) return;
   if (!fs.existsSync(file + '.bak')) fs.copyFileSync(file, file + '.bak');
@@ -58,6 +66,7 @@ function protectToc(state, file) {
 }
 
 function protectSb(state, file) {
+  if (PKG) return;
   const k = rel(file);
   if (state.files[k]) return;
   const size = fs.statSync(file).size;
@@ -99,7 +108,7 @@ const walkToc = (d, o = []) => { if (!fs.existsSync(d)) return o; for (const x o
 
 // superbundle name ("Win32/UI") -> 'delta' | 'same' | ...
 function patchLayout() {
-  const f = path.join(PATCH_DATA, 'layout.toc');
+  const f = path.join(PD, 'layout.toc');
   const m = new Map();
   if (!fs.existsSync(f)) return m;
   for (const s of L.readToc(f).superBundles || []) m.set(s.name.toLowerCase(), Object.keys(s).filter((k) => k !== 'name').join('+'));
@@ -111,7 +120,7 @@ const dirty = new Set();
 function toc(file) { if (!tocCache.has(file)) tocCache.set(file, R.readTocFile(file)); return tocCache.get(file); }
 
 function findTocChunk(guid) {
-  for (const f of [...walkToc(PATCH_DATA), ...walkToc(L.DATA_DIR)]) {
+  for (const f of [...walkToc(PD), ...walkToc(L.DATA_DIR)]) {
     const e = R.tocChunks(toc(f)).find((c) => R.entryId(c) === guid);
     if (e) return { tocFile: f, sbFile: f.replace(/\.toc$/i, '.sb'), entry: e };
   }
@@ -139,7 +148,16 @@ function collectMods() {
 function apply() {
   const mods = collectMods();
   if (!mods.length) { console.log('No mods found in', MODS); return; }
-  if (!DRY && !restore({ quiet: true })) { console.error('Previous patch could not be restored cleanly; stopping.'); process.exit(1); }
+  if (PKG) {
+    // the package is built from the ORIGINAL official patch, so the game's own files must not be patched in place
+    if (Object.keys(loadState().files).length) throw new Error('the game files are patched in place; run "restore" first');
+    if (!DRY) {
+      const stage = PKG + '.new';
+      fs.rmSync(stage, { recursive: true, force: true });
+      copyDir(PATCH_DATA, path.join(stage, 'Data'));
+      PD = path.join(stage, 'Data');
+    }
+  } else if (!DRY && !restore({ quiet: true })) { console.error('Previous patch could not be restored cleanly; stopping.'); process.exit(1); }
   const state = loadState();
   const layout = patchLayout();
   let index = null;
@@ -178,10 +196,13 @@ function apply() {
     const superName = job.sbRel.replace(/\.sb$/i, '').split(/[\\/]/).join('/').toLowerCase();
     job.flag = layout.get(superName) || '';
     if (job.flag.includes('delta')) {
-      const pf = path.join(PATCH_DATA, job.sbRel.replace(/\.sb$/i, '.toc'));
+      const pf = path.join(PD, job.sbRel.replace(/\.sb$/i, '.toc'));
       const pe = fs.existsSync(pf) && R.tocBundles(toc(pf)).find((b) => R.entryId(b).toLowerCase() === job.bundleId.toLowerCase());
       if (pe && R.entryFlag(pe, 'delta')) { job.deltaToc = pf; continue; } // the game reads this bundle from the patch delta
       if (pe) job.patchToc = pf;
+      else if (PKG) { job.skip = true; warn(`${job.bundleId}: not used by the patched game, skipped`); }
+    } else if (PKG) {
+      throw new Error(`${job.bundleId} is in ${job.sbRel}, which the official patch does not change; package mode does not support it yet`);
     }
   }
 
@@ -193,19 +214,27 @@ function apply() {
 
   // 1) chunks listed directly in a .toc
   for (const p of plan) {
-    const e = p.hit.entry;
-    const offN = R.child(e, 'offset'), sizeN = R.child(e, 'size');
-    const origSize = R.numOf(sizeN);
-    const orig = readAt(p.hit.sbFile, R.numOf(offN), Math.min(64, origSize));
+    let e = p.hit.entry, tocFile = p.hit.tocFile, sbFile = p.hit.sbFile;
+    const origSize = R.numOf(R.child(e, 'size'));
+    const orig = readAt(p.hit.sbFile, R.numOf(R.child(e, 'offset')), Math.min(64, origSize));
     const stored = R.isBlockFramed(orig, origSize) ? R.packBlocks(p.raw) : p.raw; // keep the original storage style
-    protectToc(state, p.hit.tocFile); protectSb(state, p.hit.sbFile);
-    const off = R.appendToSb(p.hit.sbFile, stored);
-    R.setNum(offN, off); R.setNum(sizeN, stored.length);
-    dirty.add(p.hit.tocFile);
+    if (PKG && tocFile.startsWith(L.DATA_DIR + path.sep)) {
+      // the chunk lives in a base toc: patch tocs list only new/changed chunks, so add an entry to the package copy
+      tocFile = path.join(PD, path.relative(L.DATA_DIR, tocFile));
+      sbFile = tocFile.replace(/\.toc$/i, '.sb');
+      const list = fs.existsSync(tocFile) && R.child(toc(tocFile).root, 'chunks');
+      if (!list) throw new Error(`chunk ${p.m.name} is in ${rel(p.hit.tocFile)}, which the official patch does not change; package mode does not support it yet`);
+      e = R.dbRead(R.dbWrite(e)).root; // a copy of the original entry (same id and field types)
+      list.v.push(e);
+    }
+    protectToc(state, tocFile); protectSb(state, sbFile);
+    const off = R.appendToSb(sbFile, stored);
+    R.setNum(R.child(e, 'offset'), off); R.setNum(R.child(e, 'size'), stored.length);
+    dirty.add(tocFile);
   }
 
   // 2a) bundles the official patch stores as deltas: write a new delta into the patch .sb
-  const COMMON = path.join(PATCH_DATA, 'common.dat');
+  const COMMON = path.join(PD, 'common.dat');
   for (const job of [...bundleJobs.values()].filter((j) => j.deltaToc)) {
     const pe = R.tocBundles(toc(job.deltaToc)).find((b) => R.entryId(b).toLowerCase() === job.bundleId.toLowerCase());
     const pSb = job.deltaToc.replace(/\.toc$/i, '.sb');
@@ -241,6 +270,22 @@ function apply() {
       }
     }
     if (!replacements.size) { fs.closeSync(fd); continue; }
+    if (PKG) {
+      // the patch reads this bundle from the base game ("base" flag): write it into the package as a delta
+      // against the base .sb, and switch the entry's flag to "delta"
+      fs.closeSync(fd);
+      const keep = new Set([...replacements.keys()].map((i) => info.entries[i].kind + ':' + info.entries[i].name.toLowerCase()));
+      const res = R.rebuildBaseAsDelta(job.sbFile, off, size, COMMON, (e) => { const k = e.kind + ':' + e.name.toLowerCase(); return keep.has(k) ? job.repl.get(k) : null; });
+      if (res.replaced !== keep.size) throw new Error('could not locate every asset inside ' + job.bundleId);
+      const pe = R.tocBundles(toc(job.patchToc)).find((b) => R.entryId(b).toLowerCase() === job.bundleId.toLowerCase());
+      const flagN = R.child(pe, 'base');
+      if (!flagN) throw new Error('unexpected patch toc entry for ' + job.bundleId);
+      flagN.name = Buffer.from('delta', 'latin1');
+      const newOff = R.appendToSb(job.patchToc.replace(/\.toc$/i, '.sb'), res.delta);
+      R.setNum(R.child(pe, 'offset'), newOff); R.setNum(R.child(pe, 'size'), res.delta.length);
+      dirty.add(job.patchToc);
+      continue;
+    }
     const rebuilt = R.rebuildBundle(fd, off, size, replacements);
     fs.closeSync(fd);
     protectToc(state, baseToc); protectSb(state, job.sbFile);
@@ -256,7 +301,48 @@ function apply() {
   }
 
   for (const f of dirty) fs.writeFileSync(f, R.encodeToc(toc(f)));
+  if (PKG) { finishPackage(); return; }
   console.log(`Done. Modified ${dirty.size} toc file(s). Undo with: node fb2_patch.js --game "<game dir>" restore`);
+}
+
+// ---------------------------------------------------------------- package mode helpers
+
+function copyDir(from, to) {
+  fs.mkdirSync(to, { recursive: true });
+  for (const x of fs.readdirSync(from, { withFileTypes: true })) {
+    const a = path.join(from, x.name), b = path.join(to, x.name);
+    if (x.isDirectory()) copyDir(a, b);
+    else if (!/\.bak$/i.test(x.name)) fs.copyFileSync(a, b); // never carry our own backups into the package
+  }
+}
+
+// A package we created has a package.mft with "Name mods"; anything else in that place is left alone.
+function isOurPackage(dir) {
+  const f = path.join(dir, 'package.mft');
+  return fs.existsSync(f) && /^Name\s+mods\s*$/im.test(fs.readFileSync(f, 'latin1'));
+}
+
+function finishPackage() {
+  const stage = PKG + '.new';
+  // the game prefers the package with the higher version: one above the official patch
+  const pm = fs.readFileSync(path.join(GAME, 'Update', 'Patch', 'package.mft'), 'latin1').match(/^Version\s+(\d+)/im);
+  const version = (pm ? Number(pm[1]) : 35) + 1;
+  fs.writeFileSync(path.join(stage, 'package.mft'), `Name mods\r\nAuthoritative\r\nVersion ${version}\r\n`);
+  if (fs.existsSync(PKG)) {
+    if (!isOurPackage(PKG)) throw new Error(`${PKG} exists and was not created by this tool; not replacing it`);
+    fs.rmSync(PKG, { recursive: true, force: true });
+  }
+  fs.renameSync(stage, PKG);
+  console.log(`Done. Mod package written to ${rel(PKG)} (version ${version}). The original game files were not changed.`);
+}
+
+function removePackage() {
+  if (!PKG) throw new Error('usage: remove-package --package <dir>');
+  fs.rmSync(PKG + '.new', { recursive: true, force: true });
+  if (!fs.existsSync(PKG)) { console.log('No mod package installed.'); return; }
+  if (!isOurPackage(PKG)) throw new Error(`${PKG} was not created by this tool; not removing it`);
+  fs.rmSync(PKG, { recursive: true, force: true });
+  console.log(`Removed ${rel(PKG)}. The game runs with its original files.`);
 }
 
 function status() {
@@ -269,7 +355,8 @@ function status() {
   for (const m of mods) console.log(`  ${m.kind} ${m.name}`);
 }
 
-if (cmd === 'apply') apply();
+if (cmd === 'apply') { try { apply(); } catch (e) { if (PKG) fs.rmSync(PKG + '.new', { recursive: true, force: true }); console.error('ERROR: ' + e.message); process.exit(1); } }
+else if (cmd === 'remove-package') removePackage();
 else if (cmd === 'restore') { const ok = restore(); process.exit(ok ? 0 : 1); }
 else if (cmd === 'status') status();
 else console.log('Commands: apply [--mods <dir>] [--dry-run] | restore | status   (shared option: --game <game dir>)');

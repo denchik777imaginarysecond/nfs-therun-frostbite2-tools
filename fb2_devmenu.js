@@ -8,6 +8,7 @@
  *   node fb2_devmenu.js disable [--game "<game dir>"]
  *   node fb2_devmenu.js status  [--game "<game dir>"]
  * Or double-click enable_devmenu.bat / disable_devmenu.bat (they ask for administrator rights).
+ * The game files are not changed: the mod goes into the Update/Mods package built by fb2_mods.js.
  */
 const fs = require('fs');
 const path = require('path');
