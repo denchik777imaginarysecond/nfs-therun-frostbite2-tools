@@ -214,9 +214,123 @@ function rebuildBundle(fd, off, size, replacements = new Map()) {
   return Buffer.concat(parts);
 }
 
+// ============================================================ delta bundles (official patch) ===
+//
+// A patch bundle with delta=true is an assembly list, not a binary diff:
+//   [u32 BE tableLen][u32 BE 0xDE17AAAA][u32 0][u32 0]
+//   table: tableLen/16 segments of [u32 size][i32 source][u32 offsetHigh][u32 offsetLow]
+//   followed by inline data.
+// The bundle is all segments concatenated in order. Source:
+//    0 -> the next `size` bytes of the inline data (read sequentially; the offset field is informational)
+//    1 -> base game .sb (Data/...) at the absolute offset
+//   -1 -> Update/Patch/Data/common.dat at the absolute offset
+// Verified: all 372 delta bundles rebuild with every ebx and compressed entry matching its header sha1.
+const DELTA_MAGIC = 0xde17aaaa;
+
+function readDelta(patchSbFile, offset, size) {
+  const fd = fs.openSync(patchSbFile, 'r');
+  try {
+    const raw = Buffer.alloc(size); fs.readSync(fd, raw, 0, size, offset);
+    const tableLen = raw.readUInt32BE(0);
+    if (raw.readUInt32BE(4) !== DELTA_MAGIC) throw new Error('not a delta bundle at ' + offset + ' in ' + patchSbFile);
+    const segs = [];
+    for (let o = 16; o < 16 + tableLen; o += 16) {
+      segs.push({ size: raw.readUInt32BE(o), src: raw.readInt32BE(o + 4), off: raw.readUInt32BE(o + 8) * 2 ** 32 + raw.readUInt32BE(o + 12) });
+    }
+    return { segs, inline: raw.subarray(16 + tableLen) };
+  } finally { fs.closeSync(fd); }
+}
+
+// Returns the full bundle and a map of where every output range came from.
+function reconstructDelta(delta, baseSbFile, commonFile) {
+  const bfd = fs.openSync(baseSbFile, 'r'), cfd = fs.openSync(commonFile, 'r');
+  try {
+    const parts = [], map = [];
+    let cur = 0, at = 0;
+    for (const s of delta.segs) {
+      let b;
+      if (s.src === 0) { b = delta.inline.subarray(cur, cur + s.size); map.push({ at, size: s.size, src: 0, off: cur }); cur += s.size; }
+      else {
+        b = Buffer.alloc(s.size);
+        fs.readSync(s.src === 1 ? bfd : cfd, b, 0, s.size, s.off);
+        if (s.src !== 1 && s.src !== -1) throw new Error('unknown delta source ' + s.src);
+        map.push({ at, size: s.size, src: s.src, off: s.off });
+      }
+      parts.push(b); at += s.size;
+    }
+    return { buf: Buffer.concat(parts), map };
+  } finally { fs.closeSync(bfd); fs.closeSync(cfd); }
+}
+
+// Runs a callback with a temporary file holding `buf` (readBundle/rebuildBundle work on file descriptors).
+let tmpCounter = 0;
+function withTempFile(buf, fn) {
+  const f = path.join(require('os').tmpdir(), `fb2_tmp_${process.pid}_${++tmpCounter}.bin`); // unique even when nested
+  fs.writeFileSync(f, buf);
+  const fd = fs.openSync(f, 'r');
+  try { return fn(fd); } finally { fs.closeSync(fd); fs.unlinkSync(f); }
+}
+
+// Encodes `newBuf` (a rebuilt bundle) as a delta. Byte ranges that are unchanged copies of the old
+// reconstructed bundle are referenced at their original sources; everything else becomes inline data.
+// copies: [{ newAt, oldAt, size }] — ranges of newBuf that equal oldBuf[oldAt..oldAt+size).
+function encodeDelta(newBuf, copies, oldMap, oldInline) {
+  const out = []; // { size, src, off, data? }
+  const push = (seg) => {
+    if (!seg.size) return;
+    const last = out[out.length - 1];
+    if (last && last.src === seg.src && seg.src !== 0 && last.off + last.size === seg.off) { last.size += seg.size; return; }
+    if (last && last.src === 0 && seg.src === 0) { last.data = Buffer.concat([last.data, seg.data]); last.size += seg.size; return; }
+    out.push(seg);
+  };
+  const inlineRange = (from, to) => push({ size: to - from, src: 0, off: 0, data: newBuf.subarray(from, to) });
+  let pos = 0;
+  for (const c of copies.sort((a, b) => a.newAt - b.newAt)) {
+    if (c.newAt > pos) inlineRange(pos, c.newAt);
+    // split the copied range along the old segment map
+    let o = c.oldAt, n = c.newAt, left = c.size;
+    while (left > 0) {
+      const m = oldMap.find((q) => o >= q.at && o < q.at + q.size);
+      const take = Math.min(left, m.at + m.size - o);
+      if (m.src === 0) push({ size: take, src: 0, off: 0, data: oldInline.subarray(m.off + (o - m.at), m.off + (o - m.at) + take) });
+      else push({ size: take, src: m.src, off: m.off + (o - m.at) });
+      o += take; n += take; left -= take;
+    }
+    pos = c.newAt + c.size;
+  }
+  if (pos < newBuf.length) inlineRange(pos, newBuf.length);
+  const table = Buffer.alloc(out.length * 16);
+  out.forEach((s, i) => {
+    table.writeUInt32BE(s.size, i * 16); table.writeInt32BE(s.src, i * 16 + 4);
+    table.writeUInt32BE(Math.floor(s.off / 2 ** 32), i * 16 + 8); table.writeUInt32BE(s.off % 2 ** 32, i * 16 + 12);
+  });
+  const head = Buffer.alloc(16);
+  head.writeUInt32BE(table.length, 0); head.writeUInt32BE(DELTA_MAGIC, 4);
+  return Buffer.concat([head, table, ...out.filter((s) => s.src === 0).map((s) => s.data)]);
+}
+
+// Applies replacements to a delta bundle; returns the new delta bytes (to append to the patch .sb).
+function rebuildDeltaBundle(patchSbFile, offset, size, baseSbFile, commonFile, replaceByName) {
+  const delta = readDelta(patchSbFile, offset, size);
+  const old = reconstructDelta(delta, baseSbFile, commonFile);
+  return withTempFile(old.buf, (fd) => {
+    const info = L.readBundle(fd, 0, old.buf.length);
+    if (!info) throw new Error('reconstructed delta bundle has no valid header');
+    const replacements = new Map();
+    info.entries.forEach((e, i) => { const r = replaceByName(e); if (r) replacements.set(i, r); });
+    const newBuf = rebuildBundle(fd, 0, old.buf.length, replacements);
+    // which ranges of the new bundle are verbatim copies of old entries?
+    const newInfo = withTempFile(newBuf, (nfd) => L.readBundle(nfd, 0, newBuf.length));
+    const copies = [];
+    info.entries.forEach((e, i) => { if (!replacements.has(i) && e.size) copies.push({ newAt: newInfo.entries[i].pos, oldAt: e.pos, size: e.size }); });
+    return { delta: encodeDelta(newBuf, copies, old.map, delta.inline), bundle: newBuf, replaced: replacements.size, entries: info.entries };
+  });
+}
+
 module.exports = {
   dbRead, dbWrite, child, numOf, setNum, strOf, readTocFile, encodeToc, tocChunks, tocBundles, entryId, entryFlag,
   packBlocks, isBlockFramed, appendToSb, rebuildBundle, bundleLayout,
+  readDelta, reconstructDelta, encodeDelta, rebuildDeltaBundle, withTempFile, DELTA_MAGIC,
 };
 
 // ============================================================ self-test ===

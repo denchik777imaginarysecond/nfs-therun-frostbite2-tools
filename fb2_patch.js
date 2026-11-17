@@ -18,7 +18,8 @@
  *   - For each touched .sb the original size and sha1 of its first/last MB are recorded;
  *     `restore` checks those hashes and truncates the file back to its original size.
  *   - `apply` always restores first, so applying again starts from clean game files.
- *   - Bundles that the official patch replaces with a delta bundle are refused (format not supported yet).
+ *   - Bundles that the official patch stores as deltas get a new delta appended to the patch .sb
+ *     (new header + changed data inline, unchanged data referenced at its original place).
  *   State file: <game dir>/fb2_patch_state.json
  */
 const fs = require('fs');
@@ -179,11 +180,7 @@ function apply() {
     if (job.flag.includes('delta')) {
       const pf = path.join(PATCH_DATA, job.sbRel.replace(/\.sb$/i, '.toc'));
       const pe = fs.existsSync(pf) && R.tocBundles(toc(pf)).find((b) => R.entryId(b).toLowerCase() === job.bundleId.toLowerCase());
-      if (pe && R.entryFlag(pe, 'delta')) {
-        if (!chunkOnly(job)) throw new Error(`bundle ${job.bundleId} is replaced by an official patch delta bundle — not supported yet`);
-        warn(`skipping chunk copy in ${job.bundleId}: official patch delta bundle (not supported yet)`);
-        job.skip = true; continue;
-      }
+      if (pe && R.entryFlag(pe, 'delta')) { job.deltaToc = pf; continue; } // the game reads this bundle from the patch delta
       if (pe) job.patchToc = pf;
     }
   }
@@ -191,7 +188,7 @@ function apply() {
   for (const [k, job] of bundleJobs) if (job.skip) bundleJobs.delete(k);
   console.log(`${DRY ? 'Plan (dry run)' : 'Applying'}: ${plan.length} toc chunk(s), ${bundleJobs.size} bundle(s)`);
   for (const p of plan) console.log(`  chunk ${p.m.name} -> ${p.where}`);
-  for (const j of bundleJobs.values()) console.log(`  bundle ${j.bundleId} (${j.sbRel}${j.patchToc ? ', also patch toc' : ''}) <- ${[...j.repl.keys()].join(', ')}`);
+  for (const j of bundleJobs.values()) console.log(`  bundle ${j.bundleId} (${j.deltaToc ? 'official patch delta -> new delta in patch .sb' : j.sbRel + (j.patchToc ? ', also patch toc' : '')}) <- ${[...j.repl.keys()].join(', ')}`);
   if (DRY) return;
 
   // 1) chunks listed directly in a .toc
@@ -207,8 +204,22 @@ function apply() {
     dirty.add(p.hit.tocFile);
   }
 
-  // 2) bundles: rebuild with replaced entries, append, repoint the .toc entries
-  for (const job of bundleJobs.values()) {
+  // 2a) bundles the official patch stores as deltas: write a new delta into the patch .sb
+  const COMMON = path.join(PATCH_DATA, 'common.dat');
+  for (const job of [...bundleJobs.values()].filter((j) => j.deltaToc)) {
+    const pe = R.tocBundles(toc(job.deltaToc)).find((b) => R.entryId(b).toLowerCase() === job.bundleId.toLowerCase());
+    const pSb = job.deltaToc.replace(/\.toc$/i, '.sb');
+    const res = R.rebuildDeltaBundle(pSb, R.numOf(R.child(pe, 'offset')), R.numOf(R.child(pe, 'size')), job.sbFile, COMMON,
+      (e) => job.repl.get(e.kind + ':' + e.name.toLowerCase()) || null);
+    if (res.replaced !== job.repl.size) throw new Error('could not locate every asset inside the patched ' + job.bundleId);
+    protectToc(state, job.deltaToc); protectSb(state, pSb);
+    const newOff = R.appendToSb(pSb, res.delta);
+    R.setNum(R.child(pe, 'offset'), newOff); R.setNum(R.child(pe, 'size'), res.delta.length);
+    dirty.add(job.deltaToc);
+  }
+
+  // 2b) regular bundles: rebuild with replaced entries, append, repoint the .toc entries
+  for (const job of [...bundleJobs.values()].filter((j) => !j.deltaToc)) {
     const baseToc = job.sbFile.replace(/\.sb$/i, '.toc');
     const be = R.tocBundles(toc(baseToc)).find((b) => R.entryId(b) === job.bundleId);
     if (!be) throw new Error('bundle not found in ' + rel(baseToc) + ': ' + job.bundleId);

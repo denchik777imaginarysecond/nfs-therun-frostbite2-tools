@@ -63,7 +63,7 @@ How it stays safe:
 - **Append-only.** New data is written at the end of the `.sb`. Existing bytes are never changed.
 - Every `.toc` is copied to `.toc.bak` before its first change. For each `.sb` the original size and the sha1 of its first and last MB are recorded, and `restore` checks them before truncating the file back.
 - `apply` always restores first, so running it again starts from clean files.
-- Bundles that the official patch replaces with delta bundles (`delta=true` in `Update/Patch`) are refused. That format is not supported yet.
+- Bundles that the official patch stores as **delta bundles** (`delta=true` in `Update/Patch`) get a new delta appended to the patch `.sb`. The new delta holds the new header and the changed data inline, and refers to the unchanged data where it already is. The base game and `common.dat` are not touched.
 - The game usually sits in `Program Files`, so patching needs a terminal started as administrator.
 
 Verified:
@@ -73,6 +73,18 @@ Verified:
 - **In the game:** replacing a res inside bundles works. The texture headers of every livery of the Chevrolet Camaro SS (1967) were swapped in 17 rebuilt bundles in `ShippingVehicles.sb`. In a race the car lost its camo livery, and after `restore` the livery came back. (Garage previews are pre-rendered images and do not change.)
 - **In the game:** PNG texture import works. A test pattern imported with `fb2_tex_import.js` into the Camaro SS (1967) liveries showed on the car in a race. In the garage the 3D car showed it for a moment and then switched back, probably because the garage also loads data from official patch delta bundles.
 - Most menu, UI and level bundles are replaced by official patch delta bundles, which are not supported yet.
+
+## Official patch delta bundles
+
+A patch bundle with `delta=true` is an assembly list, not a binary diff:
+
+```
+[u32 BE table length][u32 BE 0xDE17AAAA][u32 0][u32 0]
+table: N x [u32 size][i32 source][u32 offset high][u32 offset low]
+inline data
+```
+
+The bundle is all segments concatenated in order. Source `0` = the next bytes of the inline data, `1` = the base game `.sb` at the absolute offset, `-1` = `Update/Patch/Data/common.dat` at the absolute offset. All 372 delta bundles of the game rebuild with every entry matching its header sha1, and re-encoding them without changes gives identical bundles.
 
 ## Files
 
