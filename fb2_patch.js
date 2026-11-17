@@ -143,28 +143,34 @@ function apply() {
   const layout = patchLayout();
   let index = null;
   const getIndex = () => index || (index = L.loadIndex());
+  const haveIndex = () => fs.existsSync(L.INDEX_FILE);
+  const warn = (msg) => console.log('  WARNING: ' + msg);
   const plan = [];                 // human-readable actions
   const bundleJobs = new Map();    // key sb|bundleId -> { sbFile, bundleId, repl: Map(name -> raw) }
 
   for (const m of mods) {
     const raw = fs.readFileSync(m.file);
+    let inToc = false;
     if (m.kind === 'chunk') {
       const hit = findTocChunk(m.name);
       if (hit) {
         const keys = hit.entry.v.map((n) => n.name.toString('latin1')).sort().join(',');
         if (keys !== 'id,offset,size') throw new Error(`chunk ${m.name}: unexpected toc fields (${keys}), refusing`);
         plan.push({ m, where: rel(hit.tocFile), hit, raw });
-        continue;
+        inToc = true;
       }
+      // the same chunk may also be stored inside bundles: update those copies too
+      if (!haveIndex()) { if (inToc) { warn('no asset index: copies of ' + m.name + ' inside bundles are not updated'); continue; } }
     }
     const hits = getIndex().filter((e) => e.kind === m.kind && e.name.toLowerCase() === m.name);
-    if (!hits.length) throw new Error(`${m.kind} "${m.name}" not found in the game (check the name, or rebuild the index)`);
+    if (!hits.length && !inToc) throw new Error(`${m.kind} "${m.name}" not found in the game (check the name, or rebuild the index)`);
     for (const e of hits) {
       const key = e.sb + '|' + e.bundle;
       if (!bundleJobs.has(key)) bundleJobs.set(key, { sbFile: path.join(L.DATA_DIR, e.sb), sbRel: e.sb, bundleId: e.bundle, repl: new Map() });
       bundleJobs.get(key).repl.set(m.kind + ':' + m.name, raw);
     }
   }
+  const chunkOnly = (job) => [...job.repl.keys()].every((k) => k.startsWith('chunk:'));
 
   // check bundles against the official patch before writing anything
   for (const job of bundleJobs.values()) {
@@ -173,11 +179,16 @@ function apply() {
     if (job.flag.includes('delta')) {
       const pf = path.join(PATCH_DATA, job.sbRel.replace(/\.sb$/i, '.toc'));
       const pe = fs.existsSync(pf) && R.tocBundles(toc(pf)).find((b) => R.entryId(b).toLowerCase() === job.bundleId.toLowerCase());
-      if (pe && R.entryFlag(pe, 'delta')) throw new Error(`bundle ${job.bundleId} is replaced by an official patch delta bundle — not supported yet`);
+      if (pe && R.entryFlag(pe, 'delta')) {
+        if (!chunkOnly(job)) throw new Error(`bundle ${job.bundleId} is replaced by an official patch delta bundle — not supported yet`);
+        warn(`skipping chunk copy in ${job.bundleId}: official patch delta bundle (not supported yet)`);
+        job.skip = true; continue;
+      }
       if (pe) job.patchToc = pf;
     }
   }
 
+  for (const [k, job] of bundleJobs) if (job.skip) bundleJobs.delete(k);
   console.log(`${DRY ? 'Plan (dry run)' : 'Applying'}: ${plan.length} toc chunk(s), ${bundleJobs.size} bundle(s)`);
   for (const p of plan) console.log(`  chunk ${p.m.name} -> ${p.where}`);
   for (const j of bundleJobs.values()) console.log(`  bundle ${j.bundleId} (${j.sbRel}${j.patchToc ? ', also patch toc' : ''}) <- ${[...j.repl.keys()].join(', ')}`);
@@ -207,6 +218,18 @@ function apply() {
     const replacements = new Map();
     info.entries.forEach((e, i) => { const r = job.repl.get(e.kind + ':' + e.name.toLowerCase()); if (r) replacements.set(i, r); });
     if (replacements.size !== job.repl.size) { fs.closeSync(fd); throw new Error('could not locate every asset inside ' + job.bundleId); }
+    // trimmed chunk copies (logical offset != 0) are not supported yet: skip them, keep the rest
+    const hb4 = Buffer.alloc(4); fs.readSync(fd, hb4, 0, 4, off);
+    const hbuf = Buffer.alloc(hb4.readUInt32BE(0) + 4); fs.readSync(fd, hbuf, 0, hbuf.length, off);
+    const lay = R.bundleLayout(hbuf);
+    for (const i of [...replacements.keys()]) {
+      if (info.entries[i].kind !== 'chunk') continue;
+      if (hbuf.readUInt32BE(lay.chunkAt(i - lay.nEbx - lay.nRes) + 16) !== 0) {
+        warn(`skipping trimmed chunk copy ${info.entries[i].name} in ${job.bundleId}`);
+        replacements.delete(i);
+      }
+    }
+    if (!replacements.size) { fs.closeSync(fd); continue; }
     const rebuilt = R.rebuildBundle(fd, off, size, replacements);
     fs.closeSync(fd);
     protectToc(state, baseToc); protectSb(state, job.sbFile);

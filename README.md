@@ -49,6 +49,8 @@ mods/ebx/<asset path>.ebx             replaces an ebx in every bundle that conta
 mods/res/<asset path>.res             replaces a res in every bundle that contains it
 ```
 
+Texture import: `node fb2_tex_import.js --game "<game dir>" my.png che_cam_ss_67/vinyls/` writes a chunk mod for every texture whose name contains the text. A chunk mod also updates the copies of that chunk inside base bundles.
+
 ```bash
 node fb2_patch.js --game "<game dir>" apply --dry-run   # show the plan, write nothing
 node fb2_patch.js --game "<game dir>" apply             # patch the game
@@ -83,6 +85,7 @@ Verified:
 | `fb2_texture.js` | Texture header parser and DXT decoder, writes PNG |
 | `fb2_repack.js` | Write support: lossless DbObject/TOC writer, zlib block packer, `.sb` append, bundle rebuild, self-test |
 | `fb2_patch.js` | Mod loader: `apply`, `restore`, `status`, with backups |
+| `fb2_tex_import.js` | PNG to DXT1/DXT5 texture import: resize, mip levels, writes a chunk mod for `fb2_patch.js` |
 
 Notes on the format, as found in this game: EBX header fields are 32-bit (unlike Battlefield 3). Chunk GUIDs in bundle tables have their first three fields byte-swapped. Video and audio chunks are stored uncompressed.
 
