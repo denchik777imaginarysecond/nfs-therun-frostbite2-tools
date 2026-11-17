@@ -1,6 +1,5 @@
 @echo off
-rem Undoes enable_devmenu.bat: restores every game file changed by fb2_patch.js.
-rem Double-click to run. Asks for administrator rights.
+rem Switches the developer menu off again (other installed mods stay). Asks for administrator rights.
 
 net session >nul 2>&1
 if errorlevel 1 (
@@ -16,13 +15,19 @@ if errorlevel 1 (
   )
   exit /b
 )
+
 cd /d "%~dp0"
-where node >nul 2>&1
-if errorlevel 1 (
-  echo Node.js is not installed. Opening https://nodejs.org - install the LTS version, then run this again.
-  start "" https://nodejs.org
-  pause
-  exit /b 1
+rem use the Node.js that comes with the tool (node\node.exe) when it is there, otherwise the installed one
+set "NODE=node"
+if exist "%~dp0node\node.exe" set "NODE=%~dp0node\node.exe"
+if "%NODE%"=="node" (
+  where node >nul 2>&1
+  if errorlevel 1 (
+    echo Node.js was not found. Opening https://nodejs.org - install the LTS version, then run this again.
+    start "" https://nodejs.org
+    pause
+    exit /b 1
+  )
 )
-node fb2_devmenu.js disable %*
+"%NODE%" --max-old-space-size=8192 fb2_devmenu.js disable %*
 pause

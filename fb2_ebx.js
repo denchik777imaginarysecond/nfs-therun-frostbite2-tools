@@ -15,7 +15,8 @@
  *   0x18 type count         0x1C field count        0x20 name table length
  *   0x24 string length      0x28 array count        0x2C payload length
  *   0x30 file GUID (16)
- *   0x40 imports: N * (file GUID 16 + instance GUID 16)
+ *   0x40 GUID of the primary instance
+ *   0x50 imports: N * (file GUID 16 + instance GUID 16)
  *   then primary instance GUID (16), names, fields (16 bytes each), types (16 bytes each),
  *   instance repeaters (12 bytes: 0, repetitions, type index)
  * Type names are stored as djb2-xor hashes; the words themselves are in the name table.
@@ -47,11 +48,10 @@ function parseEbx(buf) {
     numField = u(0x1c), lenName = u(0x20), lenString = u(0x24);
   const guid = buf.toString('hex', 0x30, 0x40);
 
-  let p = 0x40;
+  // 0x40: primary instance GUID; 0x50: imports, N x [file GUID 16][instance GUID 16]
+  let p = 0x50;
   const imports = new Set();
-  // Of each 32-byte pair, the SECOND half matches file GUIDs (verified: 100% vs 0.3% for the first half).
-  for (let i = 0; i < numGuid; i++, p += 32) imports.add(buf.toString('hex', p + 16, p + 32));
-  p += 16; // primary instance GUID
+  for (let i = 0; i < numGuid; i++, p += 32) imports.add(buf.toString('hex', p, p + 16));
 
   const names = new Map(); // hash -> word
   for (const w of splitZ(buf, p, lenName)) names.set(hashName(w), w);

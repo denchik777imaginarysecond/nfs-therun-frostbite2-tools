@@ -60,3 +60,7 @@ fb2_patch_state.json
 
 # --- Mods saved by the editor (your own work; share the .nfsmod files) ---
 my_mods/
+
+# --- Per-user files: the remembered game folder, and the portable Node.js shipped in release zips ---
+game_path.txt
+node/

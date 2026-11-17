@@ -1,7 +1,7 @@
 @echo off
 rem Unlocks the hidden developer menu (Free Roam) in Need for Speed: The Run.
-rem Double-click to run. Needs Node.js 18+. Asks for administrator rights (the game is in Program Files).
-rem Custom game folder: enable_devmenu.bat --game "D:\Games\Need For Speed The Run"
+rem Double-click to run. Asks for administrator rights (the game is in Program Files).
+rem The game files are not changed: the menu is switched on through the mod package Update\Mods.
 
 net session >nul 2>&1
 if errorlevel 1 (
@@ -17,13 +17,19 @@ if errorlevel 1 (
   )
   exit /b
 )
+
 cd /d "%~dp0"
-where node >nul 2>&1
-if errorlevel 1 (
-  echo Node.js is not installed. Opening https://nodejs.org - install the LTS version, then run this again.
-  start "" https://nodejs.org
-  pause
-  exit /b 1
+rem use the Node.js that comes with the tool (node\node.exe) when it is there, otherwise the installed one
+set "NODE=node"
+if exist "%~dp0node\node.exe" set "NODE=%~dp0node\node.exe"
+if "%NODE%"=="node" (
+  where node >nul 2>&1
+  if errorlevel 1 (
+    echo Node.js was not found. Opening https://nodejs.org - install the LTS version, then run this again.
+    start "" https://nodejs.org
+    pause
+    exit /b 1
+  )
 )
-node fb2_devmenu.js enable %*
+"%NODE%" --max-old-space-size=8192 fb2_devmenu.js enable %*
 pause

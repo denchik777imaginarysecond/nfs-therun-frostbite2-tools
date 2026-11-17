@@ -34,11 +34,13 @@ function parse(b, opts = {}) {
   const u = (o) => b.readUInt32LE(o);
   if (u(0) !== 0x0fb2d1ce) throw new Error('not an ebx');
   const H = { absStr: u(4), lenEof: u(8), nImp: u(12), x10: u(16), nInst: u(20), nCx: u(24), nFld: u(28), lenName: u(32), lenStr: u(36), nArr: u(40), lenPay: u(44) };
+  // 0x30 file GUID, 0x40 GUID of the primary instance, 0x50 imports: N x [file GUID 16][instance GUID 16]
+  // (verified: all 1,047,765 imports to known files point to an instance that exists in that file)
   const guid = b.toString('hex', 0x30, 0x40);
-  let p = 0x40;
+  const primaryGuid = b.toString('hex', 0x40, 0x50);
+  let p = 0x50;
   const imports = [];
-  for (let i = 0; i < H.nImp; i++, p += 32) imports.push({ file: b.toString('hex', p + 16, p + 32), instance: b.toString('hex', p, p + 16) });
-  const primaryGuid = b.toString('hex', p, p + 16); p += 16;
+  for (let i = 0; i < H.nImp; i++, p += 32) imports.push({ file: b.toString('hex', p, p + 16), instance: b.toString('hex', p + 16, p + 32) });
   const names = new Map();
   { let s = p; for (let i = p; i < p + H.lenName; i++) if (!b[i]) { if (i > s) { const w = b.toString('latin1', s, i); names.set(hashName(w), w); } s = i + 1; } }
   p += H.lenName;

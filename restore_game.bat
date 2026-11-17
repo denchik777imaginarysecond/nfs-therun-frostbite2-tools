@@ -1,5 +1,5 @@
 @echo off
-rem Restores the original game files (removes all applied mods). Installed mods stay in the mods folder.
+rem Removes all mods from the game (deletes the Update\Mods package). Installed mods stay in the mods folder.
 rem Asks for administrator rights.
 
 net session >nul 2>&1
@@ -16,13 +16,19 @@ if errorlevel 1 (
   )
   exit /b
 )
+
 cd /d "%~dp0"
-where node >nul 2>&1
-if errorlevel 1 (
-  echo Node.js is not installed. Opening https://nodejs.org - install the LTS version, then run this again.
-  start "" https://nodejs.org
-  pause
-  exit /b 1
+rem use the Node.js that comes with the tool (node\node.exe) when it is there, otherwise the installed one
+set "NODE=node"
+if exist "%~dp0node\node.exe" set "NODE=%~dp0node\node.exe"
+if "%NODE%"=="node" (
+  where node >nul 2>&1
+  if errorlevel 1 (
+    echo Node.js was not found. Opening https://nodejs.org - install the LTS version, then run this again.
+    start "" https://nodejs.org
+    pause
+    exit /b 1
+  )
 )
-node --max-old-space-size=8192 fb2_mods.js restore %*
+"%NODE%" --max-old-space-size=8192 fb2_mods.js restore %*
 pause
