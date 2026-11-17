@@ -74,6 +74,13 @@ Verified:
 - **In the game:** PNG texture import works. A test pattern imported with `fb2_tex_import.js` into the Camaro SS (1967) liveries showed on the car in a race. In the garage the 3D car showed it for a moment and then switched back, probably because the garage also loads data from official patch delta bundles.
 - **In the game:** patching official delta bundles works. The Chevrolet garage logo header was swapped for the Dodge one in 26 delta bundles (menu, game config, every level), and the garage showed the Dodge logo for Chevrolet.
 
+## One click: developer menu (Free Roam)
+
+1. Install [Node.js](https://nodejs.org) 18 or newer.
+2. Double-click **`enable_devmenu.bat`** and allow administrator rights. The game is found automatically in the usual install folders; otherwise run `enable_devmenu.bat --game "D:\Games\Need For Speed The Run"`.
+3. Start the game: the main menu has a new **DEBUG** item -> developer menu -> **Start Free Roam**.
+4. To undo, double-click **`disable_devmenu.bat`**. It restores every changed file byte for byte.
+
 ## Recipe: unlock the developer menu (Free Roam)
 
 The main menu has a hidden item `ID_MENU_DEBUG` (in `_c4/ui/flow/screen/menu_mainmenu`). Selecting it opens `FrontEndDevGraph`: Start Free Roam, Chapter Select, Stage Select and more. In the retail game the item is hidden by a visibility condition. This makes it always visible, like the other items:
@@ -112,6 +119,7 @@ The bundle is all segments concatenated in order. Source `0` = the next bytes of
 | `fb2_tex_import.js` | PNG to DXT1/DXT5 texture import: resize, mip levels, writes a chunk mod for `fb2_patch.js` |
 | `fb2_ebx_fields.js` | Full ebx field reader: every instance and value (structs, arrays, enums, references), with the byte offset of each value. Parses all 91,715 ebx of the game |
 | `fb2_ebx_edit.js` | Shows and edits ebx values as the game sees them (official patch applied) and writes the edited ebx as a mod |
+| `fb2_devmenu.js` | One-click developer menu unlock (`enable`, `disable`, `status`), used by `enable_devmenu.bat` / `disable_devmenu.bat` |
 
 Notes on the format, as found in this game: EBX header fields are 32-bit (unlike Battlefield 3). Chunk GUIDs in bundle tables have their first three fields byte-swapped. Video and audio chunks are stored uncompressed.
 
