@@ -39,6 +39,33 @@ node fb2_loc.js --game "<game dir>" ru
 node fb2_texture.js --game "<game dir>" garage/preview
 ```
 
+## Modding (experimental)
+
+`fb2_patch.js` applies mods from a `mods/` folder. Mod files hold the **unpacked** asset data:
+
+```
+mods/chunk/<32-hex guid>.chunk        replaces a chunk (toc chunk list or bundle)
+mods/ebx/<asset path>.ebx             replaces an ebx in every bundle that contains it
+mods/res/<asset path>.res             replaces a res in every bundle that contains it
+```
+
+```bash
+node fb2_patch.js --game "<game dir>" apply --dry-run   # show the plan, write nothing
+node fb2_patch.js --game "<game dir>" apply             # patch the game
+node fb2_patch.js --game "<game dir>" status
+node fb2_patch.js --game "<game dir>" restore           # undo everything
+```
+
+How it stays safe:
+
+- **Append-only.** New data is written at the end of the `.sb`. Existing bytes are never changed.
+- Every `.toc` is copied to `.toc.bak` before its first change. For each `.sb` the original size and the sha1 of its first and last MB are recorded, and `restore` checks them before truncating the file back.
+- `apply` always restores first, so running it again starts from clean files.
+- Bundles that the official patch replaces with delta bundles (`delta=true` in `Update/Patch`) are refused. That format is not supported yet.
+- The game usually sits in `Program Files`, so patching needs a terminal started as administrator.
+
+Verified so far, without starting the game: all 100 `.toc` files re-encode byte-for-byte; unchanged bundles rebuild byte-for-byte; after a patch, our reader sees the new data; `restore` returns byte-identical files (`node fb2_repack.js --game "<game dir>" selftest`). **Whether the game accepts patched files has not been tested yet.** The `.toc` headers contain what looks like a signature.
+
 ## Files
 
 | File | What it does |
@@ -49,6 +76,8 @@ node fb2_texture.js --game "<game dir>" garage/preview
 | `fb2_chunks.js` | Finds every chunk reference by scanning all decompressed ebx/res data |
 | `fb2_loc.js` | Decoder for `LocalizedStringResource` string tables |
 | `fb2_texture.js` | Texture header parser and DXT decoder, writes PNG |
+| `fb2_repack.js` | Write support: lossless DbObject/TOC writer, zlib block packer, `.sb` append, bundle rebuild, self-test |
+| `fb2_patch.js` | Mod loader: `apply`, `restore`, `status`, with backups |
 
 Notes on the format, as found in this game: EBX header fields are 32-bit (unlike Battlefield 3). Chunk GUIDs in bundle tables have their first three fields byte-swapped. Video and audio chunks are stored uncompressed.
 

@@ -49,3 +49,8 @@ CLAUDE.md
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# --- Modding: mod data comes from the game; patch state and backups live in the game folder ---
+mods/
+*.bak
+fb2_patch_state.json
