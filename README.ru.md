@@ -14,7 +14,7 @@
 
 ## Установка
 
-1. **Скачайте** [nfs-therun-frostbite2-tools-1.1.0.zip](https://github.com/denchik777imaginarysecond/nfs-therun-frostbite2-tools/archive/refs/tags/v1.1.0.zip) (или зелёную кнопку **Code → Download ZIP** для самой свежей версии).
+1. **Скачайте** [nfs-therun-frostbite2-tools-1.2.0.zip](https://github.com/denchik777imaginarysecond/nfs-therun-frostbite2-tools/archive/refs/tags/v1.2.0.zip) (или зелёную кнопку **Code → Download ZIP** для самой свежей версии).
 2. **Распакуйте** архив куда угодно, например на рабочий стол. Только не в папку с игрой.
 3. **Закройте игру.** Дважды щёлкните **`enable_devmenu.bat`** и нажмите **«Да»**, когда Windows спросит права администратора. Игра лежит в `Program Files`, поэтому без этих прав её файлы не изменить.
 4. Дождитесь надписи **Done** в окне и нажмите любую клавишу.
@@ -50,6 +50,10 @@
 Меню разработчиков — тоже мод (`examples/DeveloperMenu`). `enable_devmenu.bat` и `disable_devmenu.bat` просто включают и выключают его вместе с остальными модами.
 
 Как сделать свой мод — в [английском README](README.md#making-a-mod-nfsmod).
+
+## Редактор
+
+Дважды щёлкните **`editor.bat`**: откроется редактор в браузере (`http://localhost:8777`). Права администратора не нужны, он только читает файлы игры. В нём можно искать ассеты, смотреть свойства и текстуры, менять значения щелчком мыши, заменять текстуры своими картинками PNG и сохранять изменения как мод `.nfsmod`. Подробнее — в [английском README](README.md#editor-in-your-browser).
 
 ## Для исследователей и моддеров
 

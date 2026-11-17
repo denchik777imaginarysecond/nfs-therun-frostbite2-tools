@@ -118,7 +118,8 @@ function pngChunk(type, data) {
   const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(td));
   return Buffer.concat([len, td, crc]);
 }
-function writePng(file, rgba, w, h, opaque) {
+// PNG file bytes from RGBA pixels (opaque: drop the alpha channel)
+function encodePng(rgba, w, h, opaque) {
   const ch = opaque ? 3 : 4;
   const raw = Buffer.alloc((w * ch + 1) * h);
   for (let y = 0; y < h; y++) {
@@ -127,9 +128,12 @@ function writePng(file, rgba, w, h, opaque) {
   }
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = opaque ? 2 : 6;
+  return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    pngChunk('IHDR', ihdr), pngChunk('IDAT', zlib.deflateSync(raw)), pngChunk('IEND', Buffer.alloc(0))]);
+}
+function writePng(file, rgba, w, h, opaque) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
-    pngChunk('IHDR', ihdr), pngChunk('IDAT', zlib.deflateSync(raw)), pngChunk('IEND', Buffer.alloc(0))]));
+  fs.writeFileSync(file, encodePng(rgba, w, h, opaque));
 }
 
 // ---------------------------------------------------------- main ----------
@@ -189,4 +193,4 @@ function main() {
 }
 
 if (require.main === module) main();
-module.exports = { parseTextureHeader, decodeDXT, writePng };
+module.exports = { parseTextureHeader, decodeDXT, writePng, encodePng, loadChunkMap, decodeTexture, TEXTURE_RES_TYPE };

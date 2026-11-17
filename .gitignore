@@ -57,3 +57,6 @@ fb2_patch_state.json
 
 # --- Packed mods (share them via releases, not the repo) ---
 *.nfsmod
+
+# --- Mods saved by the editor (your own work; share the .nfsmod files) ---
+my_mods/

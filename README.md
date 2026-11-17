@@ -18,7 +18,7 @@ The retail game still contains the developers' main menu entry **DEBUG**. It ope
 
 ### Install
 
-1. **Download** [nfs-therun-frostbite2-tools-1.1.0.zip](https://github.com/denchik777imaginarysecond/nfs-therun-frostbite2-tools/archive/refs/tags/v1.1.0.zip) (or the green **Code → Download ZIP** button for the latest version).
+1. **Download** [nfs-therun-frostbite2-tools-1.2.0.zip](https://github.com/denchik777imaginarysecond/nfs-therun-frostbite2-tools/archive/refs/tags/v1.2.0.zip) (or the green **Code → Download ZIP** button for the latest version).
 2. **Unzip** it anywhere, for example to your Desktop. Not inside the game folder.
 3. **Close the game.** Double-click **`enable_devmenu.bat`** and click **Yes** when Windows asks for administrator rights. The game sits in `Program Files`, so the tool needs them to change its files.
 4. Wait for **Done** in the window, then press any key.
@@ -89,6 +89,18 @@ node fb2_texture.js --game "<game dir>" garage/preview
 # 7. Show every value inside an ebx, as the game sees it (official patch applied)
 node fb2_ebx_edit.js --game "<game dir>" show _c4/ui/flow/screen/menu_mainmenu
 ```
+
+### Editor (in your browser)
+
+Double-click **`editor.bat`** (or `node fb2_editor.js`). It starts a small local server (127.0.0.1 only) and opens `http://localhost:8777`. It only reads the game files, so no administrator rights are needed.
+
+- Browse all 91,715 ebx and 18,154 textures by folder, or search by name.
+- EBX: every object and value as the game sees it (official patch applied), and which bundles contain the asset.
+- Textures: preview with background and transparency switches. **Replace with PNG…** puts your picture in (any size; it is resized to the texture, mip-mapped and DXT-compressed like the game expects), and "Modded (as in game)" shows the compressed result next to the original. DXT1 and DXT5 textures.
+- **Edit:** click a value (booleans, numbers, enums; references can be cleared). Changes are highlighted, can be undone one by one, and are kept in a project (`output/editor_project.json`) until you save.
+- **Project → Save:** writes `my_mods/<name>-<version>.nfsmod` (with your PNGs inside); "Save and install for me" also installs it, then run `apply_mods.bat`. Objects are found by a unique Name/Label/Id when they have one, otherwise by index.
+
+Not yet: editing text, arrays and references to other objects; textures in formats other than DXT1/DXT5.
 
 ### Making a mod (.nfsmod)
 
@@ -194,6 +206,7 @@ The bundle is all segments concatenated in order. Source `0` = the next bytes of
 |---|---|
 | `enable_devmenu.bat`, `disable_devmenu.bat` | One-click developer menu unlock / undo (ask for administrator rights) |
 | `install_mod.bat`, `apply_mods.bat`, `restore_game.bat` | Install a dropped `.nfsmod`, apply enabled mods, restore the original game (ask for administrator rights) |
+| `editor.bat`, `fb2_editor.js`, `editor/index.html` | Asset browser and value editor in the web browser; saves `.nfsmod` mods |
 | `fb2_mods.js` | Mod manager: `.nfsmod` format, install/enable/disable/remove, conflict check, apply, pack |
 | `fb2_zip.js` | Minimal ZIP reader/writer for `.nfsmod` |
 | `examples/DeveloperMenu` | The developer menu unlock as a mod |
