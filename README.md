@@ -99,6 +99,8 @@ The bundle is all segments concatenated in order. Source `0` = the next bytes of
 | `fb2_repack.js` | Write support: lossless DbObject/TOC writer, zlib block packer, `.sb` append, bundle rebuild, self-test |
 | `fb2_patch.js` | Mod loader: `apply`, `restore`, `status`, with backups |
 | `fb2_tex_import.js` | PNG to DXT1/DXT5 texture import: resize, mip levels, writes a chunk mod for `fb2_patch.js` |
+| `fb2_ebx_fields.js` | Full ebx field reader: every instance and value (structs, arrays, enums, references), with the byte offset of each value. Parses all 91,715 ebx of the game |
+| `fb2_ebx_edit.js` | Shows and edits ebx values as the game sees them (official patch applied) and writes the edited ebx as a mod |
 
 Notes on the format, as found in this game: EBX header fields are 32-bit (unlike Battlefield 3). Chunk GUIDs in bundle tables have their first three fields byte-swapped. Video and audio chunks are stored uncompressed.
 
