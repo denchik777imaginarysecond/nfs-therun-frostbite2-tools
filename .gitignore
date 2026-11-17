@@ -1,0 +1,51 @@
+# --- Dependencies ---
+node_modules/
+
+# --- Outputs, dumps, extracted data ---
+output/
+extracted/
+dumps/
+game/
+evidence/
+*.tsv
+*.jsonl
+found_strings.txt
+
+# --- Local folders that must never be published ---
+# old drafts
+_archive/
+# third-party binaries (ffmpeg, vgmstream)
+tools/
+# decompiled third-party code
+codes/
+# copies of game config files
+nfstherun/
+
+# --- Original game files and binaries ---
+*.sb
+*.toc
+*.ebx
+*.res
+*.chunk
+*.cas
+*.cat
+*.exe
+*.dll
+*.jar
+*.vp6
+*.sps
+
+# --- Logs and secrets ---
+*.log
+npm-debug.log*
+.env
+.env.*
+
+# --- Local assistant notes / editor / OS ---
+CLAUDE.md
+.claude/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
