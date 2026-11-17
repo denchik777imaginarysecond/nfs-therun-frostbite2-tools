@@ -64,7 +64,11 @@ How it stays safe:
 - Bundles that the official patch replaces with delta bundles (`delta=true` in `Update/Patch`) are refused. That format is not supported yet.
 - The game usually sits in `Program Files`, so patching needs a terminal started as administrator.
 
-Verified so far, without starting the game: all 100 `.toc` files re-encode byte-for-byte; unchanged bundles rebuild byte-for-byte; after a patch, our reader sees the new data; `restore` returns byte-identical files (`node fb2_repack.js --game "<game dir>" selftest`). **Whether the game accepts patched files has not been tested yet.** The `.toc` headers contain what looks like a signature.
+Verified:
+
+- **In the game:** replacing a localization chunk works. The game loads the modified `.toc` (the header signature is not enforced) and reads the appended, recompressed data: every menu label showed the test marker. Localization is read from `Update/Patch`, not from `Data`.
+- Offline: all 100 `.toc` files re-encode byte-for-byte; unchanged bundles rebuild byte-for-byte; `restore` returns byte-identical files (`node fb2_repack.js --game "<game dir>" selftest`).
+- Not yet tested in the game: replacing ebx/res inside bundles.
 
 ## Files
 
