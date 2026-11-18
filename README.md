@@ -88,10 +88,14 @@ node fb2_chunks.js --game "<game dir>"
 # 5. Decode the localization tables (needs step 3)
 node fb2_loc.js --game "<game dir>" ru
 
-# 6. Convert textures to PNG (DXT1/DXT5/BGRA)
+# 6. Convert textures to PNG (every format the game uses, see "Textures" below)
 node fb2_texture.js --game "<game dir>" garage/preview
 
-# 7. Show every value inside an ebx, as the game sees it (official patch applied)
+# 7. Export 3D models to .glb (Blender: File > Import > glTF)
+node fb2_mesh.js --game "<game dir>" car che_cam_ss_67        # a whole car, wheels in place
+node fb2_mesh.js --game "<game dir>" model che_cam_ss_67_kit00_stream_meshbody  # one model with every LOD, for editing
+
+# 8. Show every value inside an ebx, as the game sees it (official patch applied)
 node fb2_ebx_edit.js --game "<game dir>" show _c4/ui/flow/screen/menu_mainmenu
 ```
 
@@ -126,6 +130,7 @@ A mod is a folder (or a ZIP renamed to `.nfsmod`) with a `mod.json` and optional
       "set": { "Visibility.DataCategory": null, "Visibility.DataKey": 0, "Visibility.InvertValue": false } },
     { "type": "texture", "asset": "_c4/vehicles/nfs/che_cam_ss_67/vinyls/che_cam_ss_67_rare_texture_win32", "png": "my_livery.png" },
     { "type": "text", "id": "ef524206", "value": "DEVELOPER MENU" },
+    { "type": "mesh", "asset": "_c4/vehicles/nfs/che_cam_ss_67/kits/che_cam_ss_67_kit00_stream_meshbody", "glb": "body.glb" },
     { "type": "file", "kind": "res", "name": "<asset name>", "path": "files/asset.res" }
   ]
 }
@@ -134,7 +139,8 @@ A mod is a folder (or a ZIP renamed to `.nfsmod`) with a `mod.json` and optional
 | Change | What it does |
 |---|---|
 | `ebx` | Changes an ebx object. `where` picks the object whose fields have the given values, `"object": "<GUID>"` picks it by its GUID (what the editor writes), `"instance": n` by number; add `"all": true` to change every `where` match. `"duplicate": { "guid": "<32 hex>", "set": {…} }` adds a copy of the object (refer to it with `{ "object": "<that GUID>" }`); `"delete": true` removes it (references to it become null, list items pointing to it are removed; not the file's main object). Then runs `"remove"` (list items by their original number, e.g. `["Items.7"]`), then `"append"` (`{ "Items": <item or [items]> }`), then `"set"` (`{ "<path>": <value> }`). Paths: `Visibility.InvertValue`, `Items.3.Name`. Values: true/false, numbers, enum names, text of any length, `null`, `{ "ref": "<ebx name>" }` (another asset's main object; add `"object": "<instance GUID>"` for another object), `{ "$instance": n }` (an object of the same file). New list items that are objects only need the fields you set; the rest start empty. The whole ebx is rewritten (see `fb2_ebx_write.js`). |
-| `texture` | Replaces a texture with a PNG (resized to the texture's size; DXT1/DXT5 textures). |
+| `texture` | Replaces a texture with a PNG. The texture keeps its format (DXT1, DXT3, DXT5, BC4, BC5, DXT5 normal maps, L8, BGRA8) and, by default, its size. `"size": "png"` uses the picture's own size, `"size": [w, h]` any other (powers of two, 4 to 4096); the header and mip levels are rebuilt. |
+| `mesh` | Replaces a 3D model with a `.glb` (export it with `fb2_mesh.js model`, edit it in Blender, export as glTF binary). Objects `lod0`, `lod1`, … replace those levels of detail; levels without an object get `lod0`'s (`"keepOtherLods": true` keeps the originals). Parts are matched by material name. New vertices take the game-specific data (bone, damage, colour) of the nearest original vertex, so the car still deforms in crashes. |
 | `text` | Changes a text the player sees (menu items, car names, hints, subtitles), any length. `id` is the 8-digit text id (find it with `node fb2_loc.js --game "<game dir>" find <words>` or in the editor's Texts tab). Without `"lang"` it changes every installed language. Characters missing from the game's font may not show up. |
 | `file` | Replaces a whole ebx/res/chunk with a file from the mod (advanced; avoid shipping original game data). |
 
@@ -229,6 +235,57 @@ names, fields (16 bytes), complex types (16), instance groups [0][count][type] (
 - **Arrays:** every empty list uses the shared array 0. A non-empty list is numbered after the lists inside its items ("children first"); stored in number order as [u32 count][items], items aligned to max(4, item alignment) with the count right before them.
 - **References:** 0 = null, high bit set = import number, otherwise instance number + 1.
 
+### Textures (res type `5c4954a6`)
+
+The texture res is a 128-byte header; the pixels are a chunk (all mip levels, largest first). The TextureAsset ebx holds only the name.
+
+```
+0x08 format            0x0C flags               0x10 width (u16)     0x12 height (u16)
+0x14 depth / slices    0x1A mip count           0x1B first mip loaded later (streaming)
+0x1C chunk GUID        0x2C mip sizes (15 x u32) 0x68 total size      0x6C hash      0x70 group name
+```
+
+| Code | Format | Textures | Notes |
+|---|---|---|---|
+| 0 | DXT1 | 6656 | |
+| 18 | DXT1 | 499 | normal maps |
+| 1 | DXT3 | 5 | |
+| 2 | DXT5 | 4931 | car vinyls (liveries) |
+| 3 | BC4 | 56 | one channel (noise, masks) |
+| 17 | BC5 | 2255 | normal maps: x in red, y in green |
+| 20 | DXT5 | 24 | normal maps: x in alpha, y in green |
+| 10 | L8 | 3456 | grey, uncompressed |
+| 11 | 16-bit | 79 | lighting data |
+| 9 | BGRA8 | 191 | uncompressed |
+| 13 | RGBA16F | 2 | not decoded yet |
+
+Each format was checked by looking at the decoded pictures. Mip sizes follow the block size (4x4 blocks of 8 or 16 bytes); uncompressed rows take at least 4 bytes (a 2x2 L8 level is 8 bytes). With these rules, rebuilding the header for the same size is byte-identical for all 17,988 plain 2D textures (`node fb2_tex_import.js selftest`). A texture can be made bigger than the original: a 2048x2048 car vinyl (the original is 1024) works in the game.
+
+### 3D models (MeshSet, res type `49b156d4`)
+
+```
+header   0x10 / 0x20 bounding box min / max      0x30 LOD pointers (up to 5)     0x58 / 0x60 name, short name
+LOD      +0x04 section count   +0x08 sections    +0x40 flags (0x40 = geometry in a chunk)
+         +0x48 index bytes     +0x4C vertex bytes +0x54 chunk GUID   +0x68 inline geometry
+section  +0x08 material name   +0x14 triangles   +0x18 first index   +0x1C vertex offset   +0x20 vertex count
+         +0x34 16 x [usage, format, offset, stream]   +0x74 stride
+```
+
+- **Geometry:** the vertices of all sections, then 16-bit indices; 16-byte aligned. Models with 8 LODs keep the geometry inline (chunk GUID 0), one LOD after another from `+0x68`. A relocation table sits at the end of the res.
+- **Vertex data** (half floats): position (usage 1), normal (6), tangent (7), uv0 (0x21), uv1 (0x22), bone index (2, four equal bytes: rigid parts), vertex colour (0x1E), damage cell (0xF1), a constant 1.0 (0xF2), binormal sign (9).
+- **Cars:** every part is a model `<car>/kits/<car>_kit00_stream_mesh<part>` (body, bumpers, doors, hood, …); other body kits (`kit01v`, `kit03v`) and hood/exhaust variants are separate models. Wheel positions come from `RaceWheelComponentData.Transform` in the kit ebx. Traffic cars, brake discs and calipers keep their wheels as bone groups at the origin. The damage res (`11f603c1`) does not refer to vertices, so models can get new vertices.
+- `fb2_mesh.js selftest` reads and rewrites every model of the game byte-for-byte; a `.glb` export imported back unchanged gives identical models.
+
+### Car liveries and body colour
+
+A livery is an ebx `<car>/liveries/<car>_<name>` (`NfsVehicleLiveryData`):
+
+- **`PaintInstanceData`**: shader parameters for each car shader (`Car_Vinyl`, `CarPaintMisc`, `Wheel`, `Headlight`, …). `paintColor` is the body colour as linear RGB (for example `1, 0.036, 0.002` = red); the others set gloss and reflections (`Smoothness`, `SpecularPower`, `EnvPowFacing`, `VinylSmoothness`, …).
+- **`VinylTexture`**: a DXT5 texture painted over the body colour. Where its alpha is 0 the paint shows; where it is 255 the picture shows. Stock liveries are almost fully transparent (only stripes and logos are opaque).
+- The vinyl is mapped by the model's **first UV set (uv0)**, not uv1. In Blender this is the first UV map, which the `.glb` export and import carry, so a new model and its livery go into the game together.
+
+Verified in the game: a blue `paintColor` with a transparent vinyl holding a white centre stripe and squares placed by uv0 on the doors.
+
 ### Files
 
 | File | What it does |
@@ -236,7 +293,7 @@ names, fields (16 bytes), complex types (16), instance groups [0][count][type] (
 | `enable_devmenu.bat`, `disable_devmenu.bat` | One-click developer menu unlock / undo (ask for administrator rights) |
 | `install_mod.bat`, `manage_mods.bat`, `apply_mods.bat`, `restore_game.bat` | Install a dropped `.nfsmod`, apply enabled mods, restore the original game (ask for administrator rights) |
 | `editor.bat`, `fb2_editor.js`, `editor/index.html` | Asset browser and value editor in the web browser; saves `.nfsmod` mods |
-| `fb2_game.js` | Finds the game folder: registry, usual folders, or a folder picker; remembered in `game_path.txt` |
+| `fb2_game.js` | Finds the game folder: registry, usual folders, or a folder picker; remembered in `game_path.txt` (a `--game` option is used once and not remembered) |
 | `fb2_mods.js` | Mod manager: `.nfsmod` format, install/enable/disable/remove, conflict check, apply, pack |
 | `fb2_zip.js` | Minimal ZIP reader/writer for `.nfsmod` |
 | `examples/DeveloperMenu` | The developer menu unlock as a mod |
@@ -249,8 +306,9 @@ names, fields (16 bytes), complex types (16), instance groups [0][count][type] (
 | `fb2_analyze.js` | Reference graph: orphans, dangling references, phantom names, dev/debug content |
 | `fb2_chunks.js` | Finds every chunk reference by scanning all decompressed ebx/res data |
 | `fb2_loc.js` | Localization tables: read, search, and rebuild with texts of any length (new characters are added to the table); `selftest` checks a byte-identical rebuild |
-| `fb2_texture.js` | Texture header parser and DXT decoder, writes PNG |
-| `fb2_tex_import.js` | PNG to DXT1/DXT5 texture import: resize, mip levels, writes a chunk mod |
+| `fb2_texture.js` | Texture header parser and decoder for every format the game uses (DXT1/3/5, BC4, BC5, L8, BGRA8, …), writes PNG |
+| `fb2_tex_import.js` | PNG to texture import for the same formats: any size, mip levels, new header; `selftest` checks the header rules on every texture |
+| `fb2_mesh.js` | 3D models: MeshSet reader/writer, `.glb` export (one model or a whole car) and import (new vertices, all LODs, bounding box); `selftest` checks every model |
 | `fb2_repack.js` | Write support: lossless DbObject/TOC writer, zlib block packer, `.sb` append, bundle rebuild, delta bundles, self-test |
 | `fb2_patch.js` | Mod loader: `apply --package <dir>` builds the `Update\Mods` package; the older in-place mode (`apply`/`restore` with backups) is kept for migration and research |
 

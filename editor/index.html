@@ -67,6 +67,8 @@
   .btn.add { padding: 0 8px; margin-left: 10px; font-size: 11px; } .undo.rm { color: var(--red); }
   .objtools { margin-left: auto; display: flex; gap: 6px; } .btn.small { padding: 0 8px; font-size: 11px; } .btn.danger:hover { border-color: var(--red); color: var(--red); }
   .badge.new { background: #1d3424; color: var(--green); }
+  .meshbox { border: 1px solid var(--line); border-radius: 5px; padding: 10px 12px; margin: 0 0 12px; background: var(--panel); display: flex; flex-direction: column; gap: 8px; }
+  a.btn { text-decoration: none; display: inline-block; }
   tr.item td.k { color: var(--dim); }
   .refbox { display: flex; flex-direction: column; gap: 6px; padding: 6px 0; font-family: inherit; }
   .refbox input, .refbox select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 3px; padding: 4px 6px; font: inherit; }
@@ -105,7 +107,7 @@
 'use strict';
 // replaceChildren() would show null/undefined/false as text ("null"): skip such empty items everywhere
 const nativeReplace = Element.prototype.replaceChildren;
-Element.prototype.replaceChildren = function (...kids) { return nativeReplace.apply(this, kids.flat().filter((k) => k !== null && k !== undefined && k !== false)); };
+Element.prototype.replaceChildren = function (...kids) { return nativeReplace.apply(this, kids.flat(Infinity).filter((k) => k !== null && k !== undefined && k !== false)); };
 // Small DOM helper: el('div', {class: 'x', onclick}, child1, 'text', ...). Text is always inserted as text, never as HTML.
 function el(tag, attrs, ...kids) {
   const e = document.createElement(tag);
@@ -113,7 +115,7 @@ function el(tag, attrs, ...kids) {
     if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
     else if (v !== undefined && v !== null && v !== false) e.setAttribute(k, v);
   }
-  for (const c of kids.flat()) if (c !== null && c !== undefined && c !== false) e.append(c instanceof Node ? c : String(c));
+  for (const c of kids.flat(Infinity)) if (c !== null && c !== undefined && c !== false) e.append(c instanceof Node ? c : String(c));
   return e;
 }
 async function api(path) {
@@ -350,7 +352,7 @@ function showEbx(doc, keepOpen) {
   });
   view.replaceChildren(el('h1', {}, doc.name),
     el('div', { class: 'meta' }, `${doc.instances.length} object(s) · ${doc.size.toLocaleString()} bytes · ${doc.source} · guid ${doc.guid}`),
-    bundleList(doc.bundles), usedByList(doc.usedBy, doc.usedByCount),
+    bundleList(doc.bundles), usedByList(doc.usedBy, doc.usedByCount), meshBox(doc),
     el('p', { class: 'hint0' }, 'Click a value to change it (also texts and references). Lists: ＋ Add copies the last item, ✕ removes one. Objects: Duplicate makes a copy (point a reference or list item to it), Delete removes one. Changes are kept in the project (top right) until you save them as a mod.'),
     ...blocks);
 }
@@ -363,6 +365,40 @@ async function reloadEbx() {
   showEbx(doc, keep);
   view.scrollTop = top;
   refreshProjectButton();
+}
+
+// 3D model of this asset: export for Blender, replace with a .glb
+function meshBox(doc) {
+  const m = doc.mesh;
+  if (!m) return null;
+  const enc = encodeURIComponent(doc.name);
+  const parts = m.lods[0].sections.map((s) => s.material || '(no name)');
+  const file = el('input', { type: 'file', accept: '.glb', hidden: true });
+  const msg = el('div', {});
+  file.addEventListener('change', async () => {
+    const f = file.files[0]; if (!f) return;
+    msg.replaceChildren(el('div', { class: 'hint0' }, `Checking ${f.name}…`));
+    try {
+      const r = await fetch('/api/mesh/replace?name=' + enc, { method: 'POST', headers: { 'Content-Type': 'model/gltf-binary' }, body: f });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error);
+      refreshProjectButton(); reloadEbx();
+    } catch (e) { msg.replaceChildren(el('div', { class: 'err' }, 'Cannot use this .glb: ' + e.message)); }
+  });
+  const inline = m.lods.some((l) => l.inline);
+  return el('div', { class: 'meshbox' },
+    el('div', {}, el('b', {}, '3D model'), ` · ${m.lods.length} LOD(s) · ${m.lods[0].sections.reduce((a, s) => a + s.vertices, 0).toLocaleString()} vertices in LOD 0 · parts (materials): ${parts.join(', ')}`),
+    el('div', { class: 'tools' },
+      inline ? el('span', { class: 'n' }, 'This model keeps its geometry inside its description; export/replace is not supported for it yet.') : [
+        el('a', { class: 'btn', href: '/api/mesh.glb?name=' + enc, download: '' }, 'Export .glb'),
+        m.car ? el('a', { class: 'btn', href: '/api/car.glb?car=' + encodeURIComponent(m.car), download: '', title: 'All parts of the car with the wheels in place (for looking at it; to change a part, export that part)' }, 'Export whole car') : null,
+        m.replaced ? [el('span', { class: 'badge new' }, 'replaced'), el('button', { class: 'btn', onclick: () => file.click() }, 'Another .glb…'),
+          el('button', { class: 'btn', onclick: async () => { await post('/api/mesh/remove', { name: doc.name }); refreshProjectButton(); reloadEbx(); } }, 'Remove replacement')]
+          : el('button', { class: 'btn primary', onclick: () => file.click() }, 'Replace with .glb…'),
+      ], file),
+    m.replaced ? el('details', { class: 'bundles' }, el('summary', {}, 'What the .glb changes'), el('div', {}, m.replaced.report.map((x) => el('div', {}, x)))) : null,
+    el('div', { class: 'n' }, 'Blender: File → Import → glTF 2.0; edit; File → Export → glTF 2.0 (.glb). Keep the objects lod0, lod1, … and the material names (they say which part of the model a piece goes to). Objects missing in the file get lod0\'s geometry.'),
+    msg);
 }
 
 // unfold an object of the open file, scroll to it and flash it
@@ -394,7 +430,7 @@ function bundleList(bundles) {
 // ---------------------------------------------------------------- project panel
 async function refreshProjectButton() {
   const p = await api('/api/project');
-  const n = p.changes.length + p.textures.length + p.texts.length;
+  const n = p.changes.length + p.textures.length + p.texts.length + p.meshes.length;
   projBtn.textContent = `Project: ${n} change(s)`;
   projBtn.classList.toggle('on', n > 0);
 }
@@ -417,6 +453,10 @@ async function showProject() {
     el('td', {}, el('a', { href: '#', onclick: (e) => { e.preventDefault(); openAsset({ name: t.asset, kind: 'texture' }); } }, t.asset.split('/').pop())),
     el('td', { class: 'n' }, 'texture'), el('td', {}, 'pixels'), el('td', { class: 'v' }, `replaced with your PNG (${t.w} × ${t.h})`),
     el('td', {}, el('button', { class: 'undo', title: 'Remove this replacement', onclick: async () => { await post('/api/texture/remove', { name: t.asset }); showProject(); refreshProjectButton(); } }, '✕'))));
+  const meshRows = p.meshes.map((t) => el('tr', {},
+    el('td', {}, el('a', { href: '#', onclick: (e) => { e.preventDefault(); openAsset({ name: t.asset, kind: 'ebx' }); } }, t.asset.split('/').pop())),
+    el('td', { class: 'n' }, '3D model'), el('td', {}, 'geometry'), el('td', { class: 'v' }, 'replaced with your .glb (' + (t.report || []).filter((x) => / -> /.test(x) && !/(\d+) -> \1 vertices, (\d+) -> \2 triangles/.test(x)).length + ' part(s) changed)'),
+    el('td', {}, el('button', { class: 'undo', title: 'Remove this replacement', onclick: async () => { await post('/api/mesh/remove', { name: t.asset }); showProject(); refreshProjectButton(); } }, '✕'))));
   const textRows = p.texts.map((t) => el('tr', {},
     el('td', {}, el('a', { href: '#', onclick: (e) => { e.preventDefault(); showTexts(t.id); } }, 'text ' + t.id)),
     el('td', { class: 'n' }, 'all languages'), el('td', {}, 'text'), el('td', { class: 'v' }, JSON.stringify(t.original), ' → ', el('b', {}, JSON.stringify(t.value))),
@@ -430,7 +470,7 @@ async function showProject() {
     el('td', {}, el('button', { class: 'undo', title: 'Remove this change', onclick: async () => { try { await post('/api/undo', { id: c.id }); } catch (e) { alert(e.message); } showProject(); refreshProjectButton(); } }, '✕'))));
   view.replaceChildren(el('h1', {}, 'Project'),
     el('div', { class: 'meta' }, 'Your changes. Save them as a .nfsmod file to share, or install it for yourself.'),
-    p.changes.length || p.textures.length || p.texts.length ? el('table', { class: 'props changes' }, el('tr', {}, ...['Asset', 'Object', 'Field', 'Change', ''].map((h) => el('th', {}, h))), rows, texRows, textRows)
+    p.changes.length || p.textures.length || p.texts.length || p.meshes.length ? el('table', { class: 'props changes' }, el('tr', {}, ...['Asset', 'Object', 'Field', 'Change', ''].map((h) => el('th', {}, h))), rows, texRows, textRows, meshRows)
       : el('p', { class: 'hint0' }, 'No changes yet. Open an EBX asset and click a value to change it, or open a texture and replace it with a PNG.'),
     el('div', { class: 'form' }, field('name', 'Mod name'), field('version', 'Version'), field('author', 'Author'), field('description', 'Description', { rows: 3 })),
     el('div', { class: 'tools' },

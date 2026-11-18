@@ -38,21 +38,22 @@ function parseTextureHeader(b) {
 let chunkMap = null; // guid -> {sb, pos, size}
 function loadChunkMap(index) {
   chunkMap = new Map();
-  // 1) chunks inside bundles (already in the index)
-  for (const e of index) if (e.kind === 'chunk' && !chunkMap.has(e.name)) chunkMap.set(e.name, { sb: e.sb, pos: e.pos, size: e.size });
-  // 2) shared stores: their .toc has a chunks list {id, offset, size}
   const walk = (d, o = []) => {
+    if (!fs.existsSync(d)) return o;
     for (const x of fs.readdirSync(d, { withFileTypes: true })) {
       const f = path.join(d, x.name);
       if (x.isDirectory()) walk(f, o); else if (/\.toc$/i.test(x.name) && x.name.toLowerCase() !== 'layout.toc') o.push(f);
     }
     return o;
   };
-  for (const t of walk(path.join(L.DATA_DIR, 'Win32'))) {
-    const db = L.readToc(t);
-    const sb = path.relative(L.DATA_DIR, t.replace(/\.toc$/i, '.sb'));
-    for (const c of db.chunks || []) if (!chunkMap.has(c.id)) chunkMap.set(c.id, { sb, pos: c.offset, size: c.size });
+  // 1) shared stores (a .toc with a chunks list), the official patch first: what the game streams
+  const patchWin32 = path.join(path.dirname(L.DATA_DIR), 'Update', 'Patch', 'Data', 'Win32');
+  for (const t of [...walk(patchWin32), ...walk(path.join(L.DATA_DIR, 'Win32'))]) {
+    const sb = path.relative(L.DATA_DIR, t.replace(/\.toc$/i, '.sb')); // relative to Data (the patch is "../Update/...")
+    for (const c of L.readToc(t).chunks || []) if (!chunkMap.has(c.id)) chunkMap.set(c.id, { sb, pos: c.offset, size: c.size });
   }
+  // 2) copies inside bundles (from the index); entries without data (size 0) only refer to the stores above
+  for (const e of index) if (e.kind === 'chunk' && e.size > 0 && !chunkMap.has(e.name)) chunkMap.set(e.name, { sb: e.sb, pos: e.pos, size: e.size });
 }
 
 // ---------------------------------------------------------- DXT -------------
@@ -141,18 +142,65 @@ const fds = new Map();
 const fdOf = (sb) => { if (!fds.has(sb)) fds.set(sb, fs.openSync(path.join(L.DATA_DIR, sb), 'r')); return fds.get(sb); };
 
 // Pick the format by bytes per pixel (more reliable than guessing format codes)
+// BC4 block (8 bytes) -> 16 values 0..255 (the same scheme as the DXT5 alpha block)
+function bc4Block(src, o) {
+  const a0 = src[o], a1 = src[o + 1], pal = [a0, a1];
+  if (a0 > a1) for (let i = 1; i < 7; i++) pal.push(((7 - i) * a0 + i * a1) / 7 | 0); else { for (let i = 1; i < 5; i++) pal.push(((5 - i) * a0 + i * a1) / 5 | 0); pal.push(0, 255); }
+  const lo = src[o + 2] | (src[o + 3] << 8) | (src[o + 4] << 16), hi = src[o + 5] | (src[o + 6] << 8) | (src[o + 7] << 16);
+  return Array.from({ length: 16 }, (_, k) => pal[k < 8 ? (lo >> (3 * k)) & 7 : (hi >> (3 * (k - 8))) & 7]);
+}
+// BC4 (one channel, shown grey) and BC5 (two channels: a normal map; blue = the rebuilt z)
+function decodeBC45(src, w, h, two) {
+  const out = Buffer.alloc(w * h * 4), bs = two ? 16 : 8;
+  let o = 0;
+  for (let by = 0; by < h; by += 4) for (let bx = 0; bx < w; bx += 4, o += bs) {
+    if (o + bs > src.length) return out;
+    const r = bc4Block(src, o), g = two ? bc4Block(src, o + 8) : null;
+    for (let k = 0; k < 16; k++) {
+      const x = bx + (k & 3), y = by + (k >> 2); if (x >= w || y >= h) continue;
+      const q = (y * w + x) * 4;
+      if (!two) { out[q] = out[q + 1] = out[q + 2] = r[k]; out[q + 3] = 255; continue; }
+      const nx = r[k] / 127.5 - 1, ny = g[k] / 127.5 - 1;
+      out[q] = r[k]; out[q + 1] = g[k]; out[q + 2] = Math.round((Math.sqrt(Math.max(0, 1 - nx * nx - ny * ny)) * 0.5 + 0.5) * 255); out[q + 3] = 255;
+    }
+  }
+  return out;
+}
+// Texture formats by the code in the header (offset 0x08); each was checked by looking at decoded pictures
+const TEXTURE_FORMATS = {
+  0: { name: 'DXT1', bpp: 0.5 }, 18: { name: 'DXT1 (normal map)', bpp: 0.5 }, 1: { name: 'DXT3', bpp: 1 }, 2: { name: 'DXT5', bpp: 1 },
+  3: { name: 'BC4 (one channel)', bpp: 0.5 }, 17: { name: 'BC5 (normal map)', bpp: 1 }, 20: { name: 'DXT5 normal map (x in alpha, y in green)', bpp: 1 },
+  10: { name: 'L8 (grey, uncompressed)', bpp: 1 }, 11: { name: '16-bit lighting data (shown scaled)', bpp: 2 }, 9: { name: 'BGRA8 (uncompressed)', bpp: 4 },
+};
+function decodePixels(format, data, w, h) {
+  switch (format) {
+    case 0: case 18: return decodeDXT(data, w, h, 1);
+    case 1: return decodeDXT(data, w, h, 3);
+    case 2: return decodeDXT(data, w, h, 5);
+    case 3: return decodeBC45(data, w, h, false);
+    case 17: return decodeBC45(data, w, h, true);
+    case 20: { // DXT5 with the normal's x in alpha and y in green; z rebuilt into blue
+      const o = decodeDXT(data, w, h, 5);
+      for (let i = 0; i < o.length; i += 4) { const nx = o[i + 3] / 127.5 - 1, ny = o[i + 1] / 127.5 - 1; o[i] = o[i + 3]; o[i + 2] = Math.round((Math.sqrt(Math.max(0, 1 - nx * nx - ny * ny)) * 0.5 + 0.5) * 255); o[i + 3] = 255; }
+      return o;
+    }
+    case 10: { const o = Buffer.alloc(w * h * 4); for (let i = 0; i < w * h; i++) { o[i * 4] = o[i * 4 + 1] = o[i * 4 + 2] = data[i]; o[i * 4 + 3] = 255; } return o; }
+    case 11: { // 16-bit numbers (lighting data, not a picture): scaled so the largest value is white
+      let mx = 1; for (let i = 0; i < w * h; i++) mx = Math.max(mx, data.readUInt16LE(i * 2));
+      const o = Buffer.alloc(w * h * 4); for (let i = 0; i < w * h; i++) { o[i * 4] = o[i * 4 + 1] = o[i * 4 + 2] = Math.round(data.readUInt16LE(i * 2) / mx * 255); o[i * 4 + 3] = 255; } return o;
+    }
+    case 9: { if (data.length < w * h * 4) return null; const o = Buffer.from(data.subarray(0, w * h * 4)); for (let i = 0; i < o.length; i += 4) { const t = o[i]; o[i] = o[i + 2]; o[i + 2] = t; } return o; } // BGRA -> RGBA
+    default: return null;
+  }
+}
+
 function decodeTexture(resEntry) {
   const hdr = parseTextureHeader(L.readAsset(fdOf(resEntry.sb), resEntry));
   const loc = chunkMap.get(hdr.chunk);
   if (!loc) return { hdr, error: 'chunk not found' };
   const data = L.unpackBlocks((() => { const b = Buffer.alloc(loc.size); fs.readSync(fdOf(loc.sb), b, 0, loc.size, loc.pos); return b; })());
-  const { width: w, height: h } = hdr;
-  const bpp = hdr.mip0Size / (w * h);
-  let rgba;
-  if (bpp === 0.5) rgba = decodeDXT(data, w, h, 1);
-  else if (bpp === 1) rgba = decodeDXT(data, w, h, 5); // format code 2 = DXT5 (checked visually: DXT3 gives stripes)
-  else if (bpp === 4) { rgba = Buffer.from(data.subarray(0, w * h * 4)); for (let i = 0; i < rgba.length; i += 4) { const t = rgba[i]; rgba[i] = rgba[i + 2]; rgba[i + 2] = t; } } // BGRA -> RGBA
-  else return { hdr, error: 'unknown format: ' + bpp + ' bytes/pixel, code ' + hdr.format };
+  const rgba = decodePixels(hdr.format, data, hdr.width, hdr.height);
+  if (!rgba) return { hdr, error: `format ${hdr.format} cannot be shown yet` };
   return { hdr, rgba };
 }
 
@@ -193,4 +241,4 @@ function main() {
 }
 
 if (require.main === module) main();
-module.exports = { parseTextureHeader, decodeDXT, writePng, encodePng, loadChunkMap, decodeTexture, TEXTURE_RES_TYPE };
+module.exports = { parseTextureHeader, decodeDXT, decodePixels, bc4Block, TEXTURE_FORMATS, writePng, encodePng, loadChunkMap, decodeTexture, TEXTURE_RES_TYPE };

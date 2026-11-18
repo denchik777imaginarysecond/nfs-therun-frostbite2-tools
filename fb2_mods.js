@@ -25,9 +25,15 @@
  *         "remove": ["<list path>.<item number>", ...],
  *         "append": { "<list path>": <item> | [<items>] },
  *         "set": { "<field path>": <value>, ... } },
- *       { "type": "texture", "asset": "<texture name>", "png": "<file in the mod>" },
+ *       { "type": "texture", "asset": "<texture name>", "png": "<file in the mod>", "size": <optional "png" or [width, height]> },
  *       { "type": "text", "id": "<8-hex text id>", "value": "<new text>", "lang": "<optional: ru, en, ...>" },
+ *       { "type": "mesh", "asset": "<model name>", "glb": "<file in the mod>", "keepOtherLods": <optional true> },
  *       { "type": "file", "kind": "ebx|res|chunk", "name": "<asset name or chunk guid>", "path": "<file in the mod>" } ] }
+ * "texture" keeps the texture's size and format unless "size" is given ("png" = the picture's own size); sizes are powers
+ * of two from 4 to 4096. Formats: DXT1, DXT3, DXT5, BC4, BC5 and DXT5 normal maps, L8, BGRA8 (the texture keeps its own).
+ * "mesh" replaces a 3D model with a .glb (export one with: node fb2_mesh.js model <name>, edit it in Blender, export
+ * as .glb). Objects "lod0", "lod1", ... replace those levels of detail; LODs without an object get lod0's. Parts are
+ * matched by material name. The geometry is built on the player's PC from their own game and the .glb.
  * "text" changes a text the player sees (any length; find ids with: node fb2_loc.js find <words>, or in the editor).
  * Without "lang" it is changed in every installed language.
  * "where" picks the instance whose fields equal the given values (e.g. { "Label": "ID_MENU_DEBUG" } or { "$type": "..." }).
@@ -61,12 +67,12 @@ const [cmd, ...rest] = args;
 
 
 // ------------------------------------------------------------------ game access (loaded on demand)
-let L, F, E, TI, LOC, W, GAME;
+let L, F, E, TI, LOC, W, MESH, GAME;
 function loadGame() {
   if (L) return;
   GAME = require('./fb2_game.js').findGame({ arg: GAME_ARG, ask: true }); // registry, usual folders, or a folder picker
   process.argv = [process.argv[0], process.argv[1], '--game', GAME, '--out', OUT]; // the modules read their options here
-  L = require('./fb2_extract.js'); F = require('./fb2_ebx_fields.js'); E = require('./fb2_ebx_edit.js'); TI = require('./fb2_tex_import.js'); LOC = require('./fb2_loc.js'); W = require('./fb2_ebx_write.js');
+  L = require('./fb2_extract.js'); F = require('./fb2_ebx_fields.js'); E = require('./fb2_ebx_edit.js'); TI = require('./fb2_tex_import.js'); LOC = require('./fb2_loc.js'); W = require('./fb2_ebx_write.js'); MESH = require('./fb2_mesh.js');
 }
 const runPatch = (...a) => spawnSync(process.execPath, ['--max-old-space-size=8192', path.join(TOOL, 'fb2_patch.js'), '--game', GAME, '--out', OUT, ...a], { stdio: 'inherit' }).status === 0;
 const gamePatched = () => fs.existsSync(path.join(GAME, 'fb2_patch_state.json'));
@@ -103,7 +109,11 @@ function validateMod(m, where) {
       if (c.remove !== undefined && (!Array.isArray(c.remove) || c.remove.some((p) => !/\.\d+$/.test(p)))) bad(`${at}: "remove" must be a list of "<list path>.<item number>"`);
       if (c.append !== undefined && (typeof c.append !== 'object' || Array.isArray(c.append))) bad(`${at}: "append" must be an object of list path: item(s)`);
     }
-    else if (c.type === 'texture') { if (!c.asset || !c.png) bad(`${at}: texture needs "asset" and "png"`); }
+    else if (c.type === 'texture') {
+      if (!c.asset || !c.png) bad(`${at}: texture needs "asset" and "png"`);
+      if (c.size !== undefined && c.size !== 'png' && !(Array.isArray(c.size) && c.size.length === 2)) bad(`${at}: "size" is "png" or [width, height]`);
+    }
+    else if (c.type === 'mesh') { if (!c.asset || !c.glb) bad(`${at}: mesh needs "asset" (model name) and "glb" (file in the mod)`); }
     else if (c.type === 'text') { if (!/^(0x)?[0-9a-f]{1,8}$/i.test(String(c.id || '')) || typeof c.value !== 'string') bad(`${at}: text needs "id" (hex) and "value" (text)`); if (c.lang !== undefined && !/^[a-z]{2}$/i.test(c.lang)) bad(`${at}: "lang" must be a two-letter code like "en"`); }
     else if (c.type === 'file') { if (!['ebx', 'res', 'chunk'].includes(c.kind) || !c.name || !c.path) bad(`${at}: file needs "kind" (ebx/res/chunk), "name" and "path"`); }
     else bad(`${at}: unknown type "${c.type}"`);
@@ -137,6 +147,8 @@ function install(src) {
 }
 
 // ------------------------------------------------------------------ build: turn enabled mods into game-file mods for fb2_patch
+const resAsGameSees = (index, name, type) => MESH.resAsGameSees(index, name, type); // shared with the editor
+
 function build(write) {
   loadGame();
   if (!fs.existsSync(L.INDEX_FILE)) { console.log('Building the asset index (first run only)...'); L.buildIndex(); }
@@ -147,6 +159,7 @@ function build(write) {
   if (write) { fs.rmSync(outDir, { recursive: true, force: true }); fs.mkdirSync(outDir, { recursive: true }); }
   const ebx = new Map();                 // asset -> decoded ebx being edited (fb2_ebx_write)
   const texts = new Map();               // language -> Map(text id -> new text)
+  const meshReports = [];                // what each "mesh" change did (vertices / triangles per part)
   const owner = new Map();               // what was changed -> { mod, value }
   const conflicts = [];
   const claim = (key, mod, value, label) => {
@@ -237,13 +250,23 @@ function build(write) {
         }
       } else if (c.type === 'texture') {
         const name = c.asset.toLowerCase();
-        const e = index.find((x) => x.kind === 'res' && x.extra === '5c4954a6' && x.name.toLowerCase() === name);
-        if (!e) throw new Error(`${id}: texture not found: ${c.asset}`);
-        const hdr = L.readAsset(fs.openSync(path.join(L.DATA_DIR, e.sb), 'r'), e);
-        const tex = TI.buildTextureChunk(hdr, TI.readPng(insideMod(dir, c.png)));
+        let hdr;
+        try { hdr = MESH.resAsGameSees(index, name, '5c4954a6'); } catch { throw new Error(`${id}: texture not found: ${c.asset}`); } // header as the game sees it
+        const img = TI.readPng(insideMod(dir, c.png));
+        let tex;
+        try { tex = TI.buildTextureChunk(hdr, img, c.size ? { size: c.size === 'png' ? [img.w, img.h] : c.size } : {}); }
+        catch (err) { throw new Error(`${id}: texture ${c.asset}: ${err.message}`); }
         const guid = hdr.toString('hex', 0x1c, 0x2c);
         claim(`chunk|${guid}`, id, c.png, `texture ${c.asset}`);
         writeOut(`chunk/${guid}.chunk`, tex.data);
+        if (tex.resized) { claim(`res|${name}`, id, c.png, `texture ${c.asset} size`); writeOut(`res/${name}.res`, tex.header); } // new size: new header too
+      } else if (c.type === 'mesh') {
+        const name = c.asset.toLowerCase();
+        const r = MESH.glbToModel(index, MESH.parseMeshSet(resAsGameSees(index, name, MESH.MESH_RES_TYPE)), fs.readFileSync(insideMod(dir, c.glb)), { keepOtherLods: !!c.keepOtherLods });
+        claim(`res|${name}`, id, c.glb, `model ${name}`);
+        writeOut(`res/${name}.res`, r.res);
+        for (const [guid, data] of r.chunks) { claim(`chunk|${guid}`, id, c.glb, `model ${name} geometry`); writeOut(`chunk/${guid}.chunk`, data); }
+        meshReports.push(...r.report.map((x) => `${id}: ${name.split('/').pop()} ${x}`));
       } else if (c.type === 'text') {
         const installed = LOC.languages();
         const langs = c.lang ? [c.lang.toLowerCase()] : installed;
@@ -273,7 +296,7 @@ function build(write) {
     writeOut(`chunk/${r.strId}.chunk`, r.str);
     if (r.chars) writeOut(`chunk/${r.charsId}.chunk`, r.chars);
   }
-  return { enabled, count, conflicts, outDir };
+  return { enabled, count, conflicts, outDir, meshReports };
 }
 
 // ------------------------------------------------------------------ commands
@@ -296,6 +319,7 @@ function setEnabled(id, on) {
 function check() {
   const r = build(false);
   console.log(`${r.enabled.length} enabled mod(s), ${r.count} change(s): all resolved against the game.`);
+  if (r.meshReports.length) { console.log('Models:'); r.meshReports.forEach((x) => console.log('  ' + x)); }
   if (r.conflicts.length) { console.log('Conflicts:'); r.conflicts.forEach((c) => console.log('  - ' + c)); } else console.log('No conflicts.');
   if (gamePatched()) console.log('(The game files are patched in place by an older version of this tool; values were read from the patched files.)');
 }

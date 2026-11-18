@@ -5,7 +5,7 @@
  * Order: --game "<dir>" (passed by the caller) -> NFS_THE_RUN_DIR -> the folder chosen before (game_path.txt next to
  * the tool) -> the Windows registry (EA / Origin install key, installer uninstall entries) -> the usual folders ->
  * a folder picker window (only when allowed). A folder counts as the game when it has Data\Win32.
- * The chosen folder is remembered in game_path.txt.
+ * A folder found automatically or chosen in the picker is remembered in game_path.txt; one given with --game is not.
  */
 const fs = require('fs');
 const path = require('path');
@@ -59,7 +59,8 @@ function pickFolder() {
 
 // ask: true -> show the folder picker when nothing was found
 function findGame({ arg = null, ask = false } = {}) {
-  if (arg) { const d = normalize(arg); if (!d) throw new Error(`"${arg}" is not the Need for Speed: The Run folder (it has no Data\\Win32 folder)`); remember(d); return d; }
+  // a folder given with --game is used for this run only and NOT remembered (a test run must not redirect the player's mods)
+  if (arg) { const d = normalize(arg); if (!d) throw new Error(`"${arg}" is not the Need for Speed: The Run folder (it has no Data\\Win32 folder)`); return d; }
   const env = normalize(process.env.NFS_THE_RUN_DIR);
   if (env) return env;
   let saved = null; try { saved = normalize(fs.readFileSync(SAVED, 'utf8')); } catch { /* not chosen before */ }

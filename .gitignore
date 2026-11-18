@@ -64,3 +64,8 @@ my_mods/
 # --- Per-user files: the remembered game folder, and the portable Node.js shipped in release zips ---
 game_path.txt
 node/
+
+# --- Screenshots and pictures dropped into the project folder (never published) ---
+/*.png
+/*.jpg
+/*.jpeg

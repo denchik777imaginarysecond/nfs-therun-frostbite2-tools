@@ -142,28 +142,115 @@ function encodeDXT(img, w, h, kind) {
   return out;
 }
 
-// Builds the full chunk (all mip levels) for a texture header; checks sizes against the header.
-function buildTextureChunk(hdrBuf, image) {
-  const fmt = hdrBuf.readUInt32LE(0x08), w = hdrBuf.readUInt16LE(0x10), h = hdrBuf.readUInt16LE(0x12), mips = hdrBuf[0x1a];
-  const kind = { 0: 1, 2: 5 }[fmt];
-  if (!kind) throw new Error('texture format ' + fmt + ' is not supported (only DXT1 = 0 and DXT5 = 2)');
+// DXT3: explicit 4-bit alpha + a DXT1 colour block (always 4 colours)
+function encodeDXT3(img, w, h) {
+  const bw = Math.max(1, Math.ceil(w / 4)), bh = Math.max(1, Math.ceil(h / 4)), out = Buffer.alloc(bw * bh * 16);
+  let o = 0;
+  for (let by = 0; by < bh; by++) for (let bx = 0; bx < bw; bx++, o += 16) {
+    const px = blockPixels(img, w, h, bx * 4, by * 4);
+    px.forEach((p, i) => { const a = Math.round(p[3] / 17); out[o + (i >> 1)] |= a << ((i & 1) * 4); });
+    colorBlock(px, out, o + 8);
+  }
+  return out;
+}
+// BC4 / BC5: one or two channels, each coded like the DXT5 alpha block (channel numbers: 0 red, 1 green, 3 alpha)
+function encodeBC(img, w, h, channels) {
+  const bw = Math.max(1, Math.ceil(w / 4)), bh = Math.max(1, Math.ceil(h / 4)), bs = 8 * channels.length, out = Buffer.alloc(bw * bh * bs);
+  let o = 0;
+  for (let by = 0; by < bh; by++) for (let bx = 0; bx < bw; bx++, o += bs) {
+    const px = blockPixels(img, w, h, bx * 4, by * 4);
+    channels.forEach((c, k) => alphaBlock(px.map((p) => [0, 0, 0, p[c]]), out, o + k * 8));
+  }
+  return out;
+}
+// formats the game uses, by header code: how to encode one mip level, and the size of a level
+const BLOCK = { 0: 8, 18: 8, 3: 8, 1: 16, 2: 16, 17: 16, 20: 16 };
+const PLAIN = { 10: 1, 9: 4 };
+function encodeLevel(format, img, w, h) {
+  switch (format) {
+    case 0: case 18: return encodeDXT(img, w, h, 1);
+    case 1: return encodeDXT3(img, w, h);
+    case 2: return encodeDXT(img, w, h, 5);
+    case 3: return encodeBC(img, w, h, [0]);
+    case 17: return encodeBC(img, w, h, [0, 1]);
+    case 20: { // DXT5 normal map: x in alpha, y in green
+      const t = Buffer.alloc(img.length); for (let i = 0; i < img.length; i += 4) { t[i] = 0; t[i + 1] = img[i + 1]; t[i + 2] = 0; t[i + 3] = img[i]; }
+      return encodeDXT(t, w, h, 5);
+    }
+    case 10: { // one byte per pixel; a row takes at least 4 bytes (the rest of a short row stays 0)
+      const pitch = Math.max(4, w), o = Buffer.alloc(pitch * h);
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const i = y * w + x; o[y * pitch + x] = Math.round((img[i * 4] + img[i * 4 + 1] + img[i * 4 + 2]) / 3); }
+      return o;
+    }
+    case 9: { const o = Buffer.alloc(w * h * 4); for (let i = 0; i < w * h; i++) { o[i * 4] = img[i * 4 + 2]; o[i * 4 + 1] = img[i * 4 + 1]; o[i * 4 + 2] = img[i * 4]; o[i * 4 + 3] = img[i * 4 + 3]; } return o; }
+    default: throw new Error(`texture format ${format} cannot be written yet`);
+  }
+}
+// uncompressed: a row takes at least 4 bytes (a 2x2 L8 level is 8 bytes, 1x1 is 4) — checked on every texture header
+const levelSize = (format, w, h) => (BLOCK[format] ? Math.max(1, Math.ceil(w / 4)) * Math.max(1, Math.ceil(h / 4)) * BLOCK[format] : Math.max(4, w * PLAIN[format]) * h);
+const fullChain = (w, h) => 1 + Math.floor(Math.log2(Math.max(w, h)));
+
+// A texture header (128 bytes) for a new size: width, height, mip count, mip sizes, total size; everything else kept.
+function textureHeader(hdrBuf, w, h, mips) {
+  const fmt = hdrBuf.readUInt32LE(0x08);
+  if (!BLOCK[fmt] && !PLAIN[fmt]) throw new Error(`texture format ${fmt} cannot be written yet`);
+  if (mips < 1 || mips > 15) throw new Error('a texture has 1 to 15 mip levels');
+  const out = Buffer.from(hdrBuf);
+  out.writeUInt16LE(w, 0x10); out.writeUInt16LE(h, 0x12); out[0x1a] = mips;
+  if (out[0x1b] >= mips) out[0x1b] = 0; // levels streamed later: never more than the texture has
+  let total = 0;
+  for (let m = 0; m < 15; m++) {
+    const sz = m < mips ? levelSize(fmt, Math.max(1, w >> m), Math.max(1, h >> m)) : 0;
+    out.writeUInt32LE(sz, 0x2c + m * 4); total += sz;
+  }
+  out.writeUInt32LE(total, 0x68);
+  return out;
+}
+
+// Builds the texture's pixel chunk (every mip level) from an image. opts.size = [w, h] gives the texture a new size
+// (a new header is returned); without it the image is resized to the texture's own size.
+function buildTextureChunk(hdrBuf, image, opts = {}) {
+  const fmt = hdrBuf.readUInt32LE(0x08), ow = hdrBuf.readUInt16LE(0x10), oh = hdrBuf.readUInt16LE(0x12), omips = hdrBuf[0x1a];
+  let w = ow, h = oh, mips = omips, header = hdrBuf;
+  if (opts.size) {
+    [w, h] = opts.size.map(Number);
+    const pow2 = (x) => Number.isInteger(x) && x >= 4 && x <= 4096 && (x & (x - 1)) === 0;
+    if (!pow2(w) || !pow2(h)) throw new Error(`a texture size must be a power of two from 4 to 4096 (got ${w} x ${h})`);
+    // full mip chain if the original had one, otherwise the same number of levels (as far as the new size allows)
+    mips = omips === fullChain(ow, oh) ? fullChain(w, h) : Math.min(omips, fullChain(w, h));
+    header = textureHeader(hdrBuf, w, h, mips);
+  }
   const parts = [];
   let level = resize(image.rgba, image.w, image.h, w, h), lw = w, lh = h;
   for (let m = 0; m < mips; m++) {
-    const want = hdrBuf.readUInt32LE(0x2c + m * 4);
-    const data = encodeDXT(level, lw, lh, kind);
+    const want = header.readUInt32LE(0x2c + m * 4);
+    const data = encodeLevel(fmt, level, lw, lh);
     if (data.length !== want) throw new Error(`mip ${m}: encoded ${data.length} bytes, header expects ${want}; refusing`);
     parts.push(data);
     const nw = Math.max(1, lw >> 1), nh = Math.max(1, lh >> 1);
     level = resize(level, lw, lh, nw, nh); lw = nw; lh = nh;
   }
-  return { data: Buffer.concat(parts), w, h, kind, mips };
+  return { data: Buffer.concat(parts), header, w, h, format: fmt, mips, resized: header !== hdrBuf };
 }
 
-module.exports = { readPng, resize, encodeDXT, buildTextureChunk };
+module.exports = { readPng, resize, encodeDXT, encodeLevel, levelSize, textureHeader, buildTextureChunk };
 
 // ============================================================ CLI ===
-if (require.main === module) {
+if (require.main === module && L.OPTS.rest[0] === 'selftest') {
+  // every texture: our mip size formula = the header's sizes, and a header rebuilt for the same size = the original
+  const index = L.loadIndex(), seen = new Set(), fds = new Map();
+  const fdOf = (sb) => { if (!fds.has(sb)) fds.set(sb, fs.openSync(path.join(L.DATA_DIR, sb), 'r')); return fds.get(sb); };
+  let n = 0, same = 0, skipped = 0; const bad = {};
+  for (const e of index) {
+    if (e.kind !== 'res' || e.extra !== '5c4954a6' || seen.has(e.name)) continue; seen.add(e.name);
+    const hd = L.readAsset(fdOf(e.sb), e), f = hd.readUInt32LE(8);
+    if (!BLOCK[f] && !PLAIN[f]) { skipped++; continue; }
+    if (hd.readUInt32LE(4) !== 0) { skipped++; continue; } // cube maps / volumes: not handled
+    n++;
+    try { if (textureHeader(hd, hd.readUInt16LE(0x10), hd.readUInt16LE(0x12), hd[0x1a]).equals(hd)) same++; else { bad[f] = (bad[f] || 0) + 1; } } catch (err) { bad[err.message] = (bad[err.message] || 0) + 1; }
+  }
+  console.log(`texture headers rebuilt for the same size: ${same}/${n} byte-identical, ${skipped} skipped (other formats, cube maps)`, bad);
+} else if (require.main === module) {
   const args = L.OPTS.rest;
   const opt = (f, d) => { const i = args.indexOf(f); if (i < 0) return d; const v = args[i + 1]; args.splice(i, 2); return v; };
   const mods = path.resolve(opt('--mods', 'mods'));

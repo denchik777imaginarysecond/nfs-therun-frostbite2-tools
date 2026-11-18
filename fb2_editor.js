@@ -21,6 +21,10 @@
  *   GET /api/texts?q=<words or id>     texts the player sees (all languages), max 300, with your edits
  *   POST /api/text/set {id, value}     change a text (any length; in every installed language)
  *   POST /api/text/unset {id}          undo a text change
+ *   GET /api/mesh.glb?name=<model>     a 3D model with every LOD as .glb (for Blender)
+ *   GET /api/car.glb?car=<car id>      a whole car (all parts, wheels in place) as .glb
+ *   POST /api/mesh/replace?name=<model> (body: .glb)   replace a model with your .glb (checked, then kept in the project)
+ *   POST /api/mesh/remove {name}       undo a model replacement
  *   GET /api/project                   the edits so far (and the mod.json they make)
  *   POST /api/set {asset, instance, path, value}   change a value (checked, then kept in the project)
  *   POST /api/unset {asset, instance, path}        undo one value change
@@ -54,6 +58,7 @@ const TI = require('./fb2_tex_import.js');
 const crypto = require('crypto');
 const LOC = require('./fb2_loc.js');
 const W = require('./fb2_ebx_write.js');
+const MESH = require('./fb2_mesh.js');
 
 // ---------------------------------------------------------------- asset lists (built once at start)
 if (!fs.existsSync(L.INDEX_FILE)) { console.log('Building the asset index (first run only, a few minutes)...'); L.buildIndex(); }
@@ -67,6 +72,7 @@ for (const e of index) {
   if (!assets.has(key)) assets.set(key, { name: e.name, kind, entry: e });
 }
 const sorted = [...assets.values()].sort((a, b) => a.name.localeCompare(b.name));
+const meshNames = new Set(index.filter((e) => e.kind === 'res' && e.extra === MESH.MESH_RES_TYPE).map((e) => e.name.toLowerCase()));
 let chunksReady = false;
 const ensureChunks = () => { if (!chunksReady) { T.loadChunkMap(index); chunksReady = true; } };
 console.log(`${sorted.filter((a) => a.kind === 'ebx').length} ebx, ${sorted.filter((a) => a.kind === 'texture').length} textures`);
@@ -137,11 +143,12 @@ function bundlesOf(kind, name) {
 // ---------------------------------------------------------------- project: the edits that will become a mod
 // Saved after every change to output/editor_project.json, so closing the editor loses nothing.
 const PROJECT_FILE = path.join(__dirname, 'output', 'editor_project.json');
-let project = { name: 'My Mod', version: '1.0.0', author: '', description: '', changes: [], textures: [], texts: [] };
+let project = { name: 'My Mod', version: '1.0.0', author: '', description: '', changes: [], textures: [], texts: [], meshes: [] };
 const FILES_DIR = path.join(__dirname, 'output', 'editor_files'); // PNGs added to the project
 try { project = { ...project, ...JSON.parse(fs.readFileSync(PROJECT_FILE, 'utf8')) }; } catch { /* new project */ }
 if (!Array.isArray(project.textures)) project.textures = [];
 if (!Array.isArray(project.texts)) project.texts = [];
+if (!Array.isArray(project.meshes)) project.meshes = [];
 const saveProject = () => { fs.mkdirSync(path.dirname(PROJECT_FILE), { recursive: true }); fs.writeFileSync(PROJECT_FILE, JSON.stringify(project, null, 1)); };
 
 const baseCache = new Map(); // ebx name -> { data, source } as the game sees it (no edits)
@@ -349,12 +356,13 @@ function modJson(meta) {
   }
   const tex = project.textures.map((t) => ({ type: 'texture', asset: t.asset, png: 'textures/' + modPngName(t) }));
   tex.push(...project.texts.map((t) => ({ type: 'text', id: t.id, value: t.value })));
+  tex.push(...project.meshes.map((t) => ({ type: 'mesh', asset: t.asset, glb: 'models/' + t.asset.split('/').pop() + '.glb' })));
   return { format: 1, name: meta.name, version: meta.version || '1.0.0', author: meta.author || '', description: meta.description || '', changes: [...out, ...tex] };
 }
 
 function saveMod(meta, install) {
   if (!meta.name || !meta.name.trim()) throw new Error('give the mod a name');
-  if (!project.changes.length && !project.textures.length && !project.texts.length) throw new Error('the project has no changes yet');
+  if (!project.changes.length && !project.textures.length && !project.texts.length && !project.meshes.length) throw new Error('the project has no changes yet');
   Object.assign(project, { name: meta.name.trim(), version: meta.version || '1.0.0', author: meta.author || '', description: meta.description || '' });
   saveProject();
   const M = require('./fb2_mods.js');
@@ -372,6 +380,12 @@ function saveMod(meta, install) {
     const data = fs.readFileSync(path.join(FILES_DIR, t.file));
     fs.writeFileSync(path.join(folder, 'textures', modPngName(t)), data);
     files.push({ name: 'textures/' + modPngName(t), data });
+  }
+  if (project.meshes.length) fs.mkdirSync(path.join(folder, 'models'), { recursive: true });
+  for (const t of project.meshes) {
+    const data = fs.readFileSync(path.join(FILES_DIR, t.file)), rel = 'models/' + t.asset.split('/').pop() + '.glb';
+    fs.writeFileSync(path.join(folder, rel), data);
+    files.push({ name: rel, data });
   }
   const file = path.join(outDir, `${slug}-${mod.version}.nfsmod`);
   fs.writeFileSync(file, Z.writeZip(files));
@@ -425,6 +439,31 @@ function unsetText(id) {
   return { ok: true };
 }
 
+// ---------------------------------------------------------------- 3D models
+const meshOf = (name) => MESH.parseMeshSet(MESH.resAsGameSees(index, name, MESH.MESH_RES_TYPE));
+// the car a model belongs to (its parts can be exported together): _c4/vehicles/nfs/<car>/kits/<car>_kit00_stream_mesh<part>
+const carOf = (name) => { const m = String(name).toLowerCase().match(/^_c4\/vehicles\/nfs\/([^/]+)\/kits\/\1_kit00_stream_mesh/); return m ? m[1] : null; };
+function meshInfo(name) {
+  if (!meshNames.has(name.toLowerCase())) return null;
+  const m = meshOf(name);
+  const rep = project.meshes.find((t) => t.asset === name.toLowerCase());
+  return { lods: m.lods.map((l) => ({ inline: MESH.isInline(l), sections: l.sections.map((x) => ({ material: x.material, vertices: x.vertexCount, triangles: x.triangles })) })),
+    car: carOf(name), replaced: rep ? { report: rep.report } : null };
+}
+function replaceMesh(name, glb) {
+  const asset = name.toLowerCase();
+  if (!meshNames.has(asset)) throw new Error('not a 3D model: ' + name);
+  const r = MESH.glbToModel(index, meshOf(asset), glb); // throws with a clear message when the .glb does not fit
+  fs.mkdirSync(FILES_DIR, { recursive: true });
+  const file = crypto.createHash('sha1').update(glb).digest('hex').slice(0, 16) + '.glb';
+  fs.writeFileSync(path.join(FILES_DIR, file), glb);
+  project.meshes = project.meshes.filter((t) => t.asset !== asset);
+  project.meshes.push({ asset, file, report: r.report });
+  saveProject();
+  return { ok: true, report: r.report };
+}
+function removeMesh(name) { project.meshes = project.meshes.filter((t) => t.asset !== String(name).toLowerCase()); saveProject(); return { ok: true }; }
+
 function ebx(name) {
   const cur = editedEbx(name);
   const p = cur.p, data = cur.buf, source = cur.source;
@@ -453,7 +492,7 @@ function ebx(name) {
   const users = [...(usedBy.get(p.guid) || [])].sort();
   return { name, source, guid: p.guid, primaryGuid: p.primaryGuid, enums, size: data.length, edits, lists,
     imports: p.imports.map((i) => ({ ...i, name: guidName.get(i.file) || null })), usedBy: users.slice(0, 500), usedByCount: users.length,
-    bundles: bundlesOf('ebx', name), instances: p.instances.map((i, n) => ({ index: n, guid: i.guid, value: i.value, isNew: created.has(i.guid), usedOutside: (importedObjects.get(i.guid) || new Set()).size })) };
+    bundles: bundlesOf('ebx', name), mesh: meshInfo(name), instances: p.instances.map((i, n) => ({ index: n, guid: i.guid, value: i.value, isNew: created.has(i.guid), usedOutside: (importedObjects.get(i.guid) || new Set()).size })) };
 }
 
 function textureEntry(name) {
@@ -548,9 +587,13 @@ const server = http.createServer(async (req, res) => {
       // accept only requests from the editor page itself (a web site in another tab cannot send them)
       // (other sites can only send "simple" requests without a preflight; JSON and PNG bodies need one, and we never allow it)
       const ctype = req.headers['content-type'];
-      if (!['application/json', 'image/png'].includes(ctype) || (req.headers.origin && !/^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(req.headers.origin))) return json(res, { error: 'forbidden' }, 403);
+      if (!['application/json', 'image/png', 'model/gltf-binary'].includes(ctype) || (req.headers.origin && !/^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(req.headers.origin))) return json(res, { error: 'forbidden' }, 403);
       if (ctype === 'image/png') {
         if (u.pathname === '/api/texture/replace') return json(res, replaceTexture(q('name'), await readRaw(req, 64 << 20)));
+        return json(res, { error: 'not found' }, 404);
+      }
+      if (ctype === 'model/gltf-binary') {
+        if (u.pathname === '/api/mesh/replace') return json(res, replaceMesh(q('name'), await readRaw(req, 256 << 20)));
         return json(res, { error: 'not found' }, 404);
       }
       const b = await readBody(req);
@@ -563,13 +606,21 @@ const server = http.createServer(async (req, res) => {
       if (u.pathname === '/api/unset') return json(res, unsetValue(b.asset, Number(b.instance), b.path));
       if (u.pathname === '/api/save') return json(res, saveMod(b, !!b.install));
       if (u.pathname === '/api/texture/remove') return json(res, removeTexture(String(b.name)));
+      if (u.pathname === '/api/mesh/remove') return json(res, removeMesh(String(b.name)));
       if (u.pathname === '/api/text/set') return json(res, setText(String(b.id), String(b.value)));
       if (u.pathname === '/api/text/unset') return json(res, unsetText(String(b.id)));
-      if (u.pathname === '/api/project/clear') { project.changes = []; project.textures = []; project.texts = []; saveProject(); return json(res, { changes: 0 }); }
+      if (u.pathname === '/api/project/clear') { project.changes = []; project.textures = []; project.texts = []; project.meshes = []; saveProject(); return json(res, { changes: 0 }); }
       return json(res, { error: 'not found' }, 404);
     }
     if (u.pathname === '/api/project') return json(res, { ...project, modJson: modJson(project) });
     if (u.pathname === '/api/texts') return json(res, searchTexts(q('q')));
+    if (u.pathname === '/api/mesh.glb' || u.pathname === '/api/car.glb') {
+      const car = u.pathname === '/api/car.glb';
+      const glb = car ? MESH.toGlb(MESH.carParts(index, q('car')), q('car')) : MESH.modelToGlb(index, meshOf(q('name')));
+      const file = (car ? q('car') : q('name').split('/').pop()) + '.glb';
+      res.writeHead(200, { 'Content-Type': 'model/gltf-binary', 'Content-Disposition': `attachment; filename="${file.replace(/[^\w.-]/g, '_')}"`, 'Cache-Control': 'no-store' });
+      return res.end(glb);
+    }
     if (u.pathname === '/api/assets') return json(res, { results: search(q('q')).results.filter((a) => a.kind === 'ebx').slice(0, 50).map((a) => a.name) });
     if (u.pathname === '/') return send(res, 200, 'text/html; charset=utf-8', fs.readFileSync(PAGE)); // re-read: edits show up on reload
     if (u.pathname === '/api/info') return json(res, { game: GAME, ebx: sorted.filter((a) => a.kind === 'ebx').length, textures: sorted.filter((a) => a.kind === 'texture').length });
