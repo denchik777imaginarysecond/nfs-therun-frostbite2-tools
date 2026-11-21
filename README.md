@@ -140,7 +140,7 @@ A mod is a folder (or a ZIP renamed to `.nfsmod`) with a `mod.json` and optional
 |---|---|
 | `ebx` | Changes an ebx object. `where` picks the object whose fields have the given values, `"object": "<GUID>"` picks it by its GUID (what the editor writes), `"instance": n` by number; add `"all": true` to change every `where` match. `"duplicate": { "guid": "<32 hex>", "set": {…} }` adds a copy of the object (refer to it with `{ "object": "<that GUID>" }`); `"delete": true` removes it (references to it become null, list items pointing to it are removed; not the file's main object). Then runs `"remove"` (list items by their original number, e.g. `["Items.7"]`), then `"append"` (`{ "Items": <item or [items]> }`), then `"set"` (`{ "<path>": <value> }`). Paths: `Visibility.InvertValue`, `Items.3.Name`. Values: true/false, numbers, enum names, text of any length, `null`, `{ "ref": "<ebx name>" }` (another asset's main object; add `"object": "<instance GUID>"` for another object), `{ "$instance": n }` (an object of the same file). New list items that are objects only need the fields you set; the rest start empty. The whole ebx is rewritten (see `fb2_ebx_write.js`). |
 | `texture` | Replaces a texture with a PNG. The texture keeps its format (DXT1, DXT3, DXT5, BC4, BC5, DXT5 normal maps, L8, BGRA8) and, by default, its size. `"size": "png"` uses the picture's own size, `"size": [w, h]` any other (powers of two, 4 to 4096); the header and mip levels are rebuilt. |
-| `mesh` | Replaces a 3D model with a `.glb` (export it with `fb2_mesh.js model`, edit it in Blender, export as glTF binary). Objects `lod0`, `lod1`, … replace those levels of detail; levels without an object get `lod0`'s (`"keepOtherLods": true` keeps the originals). Parts are matched by material name. New vertices take the game-specific data (bone, damage, colour) of the nearest original vertex, so the car still deforms in crashes. |
+| `mesh` | Replaces a 3D model with a `.glb` (export it with `fb2_mesh.js model`, edit it in Blender, export as glTF binary). Objects `lod0`, `lod1`, … replace those levels of detail; levels without an object get `lod0`'s (`"keepOtherLods": true` keeps the originals). Parts are matched by material name. New vertices take the game-specific data (bone, damage, colour) of the nearest original vertex, so the car still deforms in crashes; a triangle never mixes two bones (no stretched slivers when parts move). `"clearOthers": true` hides the parts the `.glb` does not have (except `"keepParts": [names]`), `"hide": true` (no `.glb`) hides the whole model, `"evenShade": true` gives new geometry an even light baked shade instead of the old shape's. |
 | `text` | Changes a text the player sees (menu items, car names, hints, subtitles), any length. `id` is the 8-digit text id (find it with `node fb2_loc.js --game "<game dir>" find <words>` or in the editor's Texts tab). Without `"lang"` it changes every installed language. Characters missing from the game's font may not show up. |
 | `file` | Replaces a whole ebx/res/chunk with a file from the mod (advanced; avoid shipping original game data). |
 
@@ -286,6 +286,29 @@ A livery is an ebx `<car>/liveries/<car>_<name>` (`NfsVehicleLiveryData`):
 
 Verified in the game: a blue `paintColor` with a transparent vinyl holding a white centre stripe and squares placed by uv0 on the doors.
 
+The **garage** does not use that picture. It builds its preview from vinyl templates (`vinyls/<car>_<name>`, `NfsVinylTemplateAsset` → `textures/vinyls/<car>/<name>`, `NfsVinylTextureAsset`): a stack of layers, each a 512×512 L8 mask `<name>_<n>_win32` plus a fill colour (`Effects[0].Color0`, picture colour / 255). The masks are inverted (black = the layer is here), the last layer is on top, and the garage lays the result by uv0 **upside down**. All of this was confirmed in the game with coloured test bands.
+
+### Porting a car model (fb2_carport.js)
+
+Puts a whole car model from a `.glb` onto a car of the game, so it drives, crashes and shows up in the garage like the original. Verified in the game with a complete car: body, crash damage and loose parts, breaking glass, headlights and rear lights (tail, brake, reverse), interior, its own livery in races and in the garage.
+
+```bash
+node fb2_carport.js --game "<game dir>" my_ports/<name>/port.json   # writes my_ports/<name>/mod
+node fb2_mods.js install my_ports/<name>/mod
+```
+
+`port.json` names the car of the game that is replaced, the `.glb`, its scale and which pieces of the model are what (rules on piece and material names). Everything else is automatic:
+
+- **Lined up** with the car's wheels; **every body kit** and hood/exhaust variant of the car gets the model.
+- **Split into the car's parts** (`"split"`): each triangle goes to the part (hood, doors, bumpers, ...) whose original vertex is nearest, so it gets that part's bones and damage. `"near"` keeps big panels off small moving parts.
+- **Glass** in the glass layer and in both crack layers (`"copies"`); **headlights** in an opaque part plus the glow layer (the game's headlight shader is see-through).
+- **Textures**: the car's own textures (headlight, rear lights, interior, details, wheels) get the model's pictures, packed into atlases; glow masks follow the original's channel scheme (front: red = blue; rear: red tail, red + blue brake, green reverse); alpha keeps the original's strength. Textures shared with other cars are never changed.
+- **Lights**: flare and light markers are moved onto the model's lamps (`"lights"`).
+- **All paint jobs** of the car are replaced: race liveries (the model's paint picture by uv0, 2048), garage templates (the picture split into the layer colours) and body colours. The paint material is found by name, or it is the material covering most of the body.
+- **Wheels** (`"wheel": true`): one front and one rear wheel cut out and moved to the origin like the game's wheel models.
+
+Do not publish models taken from other games: share the `port.json`, and let every player use their own copy of the model. The `my_ports/` folder is ignored by git for this reason.
+
 ### Files
 
 | File | What it does |
@@ -309,6 +332,7 @@ Verified in the game: a blue `paintColor` with a transparent vinyl holding a whi
 | `fb2_texture.js` | Texture header parser and decoder for every format the game uses (DXT1/3/5, BC4, BC5, L8, BGRA8, …), writes PNG |
 | `fb2_tex_import.js` | PNG to texture import for the same formats: any size, mip levels, new header; `selftest` checks the header rules on every texture |
 | `fb2_mesh.js` | 3D models: MeshSet reader/writer, `.glb` export (one model or a whole car) and import (new vertices, all LODs, bounding box); `selftest` checks every model |
+| `fb2_carport.js` | Ports a whole car model from a `.glb` onto a car of the game (parts, bones, glass, lights, textures, all paint jobs, wheels) and writes a mod |
 | `fb2_repack.js` | Write support: lossless DbObject/TOC writer, zlib block packer, `.sb` append, bundle rebuild, delta bundles, self-test |
 | `fb2_patch.js` | Mod loader: `apply --package <dir>` builds the `Update\Mods` package; the older in-place mode (`apply`/`restore` with backups) is kept for migration and research |
 

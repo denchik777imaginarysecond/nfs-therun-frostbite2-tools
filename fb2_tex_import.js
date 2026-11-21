@@ -18,8 +18,10 @@ const T = require('./fb2_texture.js');
 
 // ============================================================ PNG reader ===
 
+// file: a path, or the PNG bytes themselves (a Buffer). Bit depths 1/2/4 (palette, grey), 8 and 16.
 function readPng(file) {
-  const b = fs.readFileSync(file);
+  const b = Buffer.isBuffer(file) ? file : fs.readFileSync(file);
+  if (Buffer.isBuffer(file)) file = 'image';
   if (b.readUInt32BE(0) !== 0x89504e47) throw new Error('not a PNG file: ' + file);
   let p = 8, w, h, depth, ctype, interlace, plte = null, trns = null;
   const idat = [];
@@ -33,10 +35,11 @@ function readPng(file) {
     p += 12 + len;
   }
   if (interlace) throw new Error('interlaced PNG is not supported: re-save it without interlacing');
-  if (depth !== 8 && depth !== 16) throw new Error('PNG bit depth ' + depth + ' is not supported (use 8-bit)');
   const chans = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 }[ctype];
   if (!chans) throw new Error('PNG color type ' + ctype + ' is not supported');
-  const bpp = chans * (depth / 8), stride = w * bpp;
+  const small = depth < 8; // 1, 2 or 4 bits: only palette and grey pictures
+  if (!(depth === 8 || depth === 16 || (small && (ctype === 0 || ctype === 3) && [1, 2, 4].includes(depth)))) throw new Error('PNG bit depth ' + depth + ' is not supported (use 8-bit)');
+  const bpp = Math.max(1, chans * (depth / 8)), stride = Math.ceil((w * chans * depth) / 8); // bpp: bytes the row filters look back
   const raw = zlib.inflateSync(Buffer.concat(idat));
   const px = Buffer.alloc(h * stride);
   for (let y = 0; y < h; y++) { // undo the per-row filters
@@ -51,10 +54,14 @@ function readPng(file) {
   }
   const rgba = Buffer.alloc(w * h * 4);
   const s8 = (i) => px[i * (depth / 8)]; // 16-bit: take the high byte
+  // a sample of 1/2/4 bits: pixel x of row y, packed from the highest bits of each byte
+  const bits = (i) => { const x = i % w, y = (i - x) / w, bit = x * depth; return (px[y * stride + (bit >> 3)] >> (8 - depth - (bit & 7))) & ((1 << depth) - 1); };
   for (let i = 0; i < w * h; i++) {
     const o = i * chans;
     let r, g, bl, al = 255;
-    if (ctype === 0) r = g = bl = s8(o);
+    if (small && ctype === 0) r = g = bl = Math.round((bits(i) * 255) / ((1 << depth) - 1));
+    else if (small) { const k = bits(i); r = plte[k * 3]; g = plte[k * 3 + 1]; bl = plte[k * 3 + 2]; al = trns && k < trns.length ? trns[k] : 255; }
+    else if (ctype === 0) r = g = bl = s8(o);
     else if (ctype === 4) { r = g = bl = s8(o); al = s8(o + 1); }
     else if (ctype === 2) { r = s8(o); g = s8(o + 1); bl = s8(o + 2); }
     else if (ctype === 6) { r = s8(o); g = s8(o + 1); bl = s8(o + 2); al = s8(o + 3); }

@@ -236,6 +236,8 @@ function templatedVertex(section, values, pool = section.vertices) {
       if (best && (r * ix.size) ** 2 > bd) break; // nothing in farther rings can be nearer
     }
   }
+  // 3) far outside the original part (a new model bigger than the old one): the nearest of all vertices
+  if (!best) for (const v of pool) { if (!v.raw || !v.position) continue; const d = score(v); if (d < bd) { bd = d; best = v; } }
   if (!best) throw new Error(`${section.material}: no vertex to use as a template`);
   const v = { ...best, raw: Buffer.from(best.raw) };
   for (const k of ['position', 'normal', 'tangent', 'uv0', 'uv1']) {
@@ -526,15 +528,39 @@ function readGlb(buf) {
 // Object "lod<n>" replaces LOD n; LODs without an object get lod0's (opts.keepOtherLods: keep their own geometry).
 // Primitives go to the section with the same material name (".001" suffixes of Blender are ignored); a section without
 // primitives keeps its geometry. New vertices take bone / damage / colour data from the nearest original vertex.
+// A section made invisible: one vertex (an original one, so its bytes stay valid) and one triangle of zero size.
+// Safer than an empty section: the game never meets a part without vertices.
+function collapseSection(s) {
+  if (!s.vertices.length) return;
+  s.vertices = [s.vertices[0]]; s.triangles = [[0, 0, 0]];
+}
+
+// opts.hide: every part of every LOD is made invisible (no .glb needed); opts.clearOthers: parts that the .glb does
+// not mention are made invisible instead of keeping their geometry.
 function glbToModel(index, mesh, glbBuf, opts = {}) {
+  if (opts.hide) {
+    const report = [], ups = new Map(), chunks = new Map();
+    mesh.lods.forEach((lod, li) => {
+      if (isInline(lod)) throw new Error('this model keeps its geometry inside the res; hiding it is not supported yet');
+      const ed = readEditable(lod, lodData(index, mesh, lod));
+      const keep = new Set(opts.keepParts || []);
+      ed.forEach((s) => { if (!keep.has(s.material)) collapseSection(s); });
+      const w = writeGeometry(ed);
+      ups.set(li, w); chunks.set(lod.chunk, w.data);
+      report.push(`LOD ${li}: parts hidden${keep.size ? ' except ' + [...keep].join(', ') : ''}`);
+    });
+    return { res: updateMeshSet(mesh, ups), chunks, report };
+  }
   const objs = readGlb(glbBuf);
   const lodObj = (i) => objs.find((o) => o.name.toLowerCase() === 'lod' + i) || objs.find((o) => o.meshName.toLowerCase() === 'lod' + i);
   if (!lodObj(0) && objs.length !== 1) throw new Error(`the .glb needs an object named "lod0" (it has: ${objs.map((o) => o.name).join(', ') || 'no objects'})`);
   const report = [], ups = new Map(), chunks = new Map();
   const strip = (n) => String(n).replace(/\.\d{3}$/, '');
+  let lod0Editable = null; // LOD 0 parts, read only when a lower LOD needs templates from them
   mesh.lods.forEach((lod, li) => {
     let obj = lodObj(li);
-    if (!obj) { if (opts.keepOtherLods) return; obj = lodObj(0) || objs[0]; }
+    let borrowed = false; // this LOD gets lod0's object: parts it does not have (e.g. the interior far away) are left out
+    if (!obj) { if (opts.keepOtherLods) return; obj = lodObj(0) || objs[0]; borrowed = true; }
     if (isInline(lod)) throw new Error('this model keeps its geometry inside the res; replacing it is not supported yet');
     const ed = readEditable(lod, lodData(index, mesh, lod));
     // which section does a material name mean? exact name, or "<name>__s<n>" for duplicates
@@ -554,9 +580,21 @@ function glbToModel(index, mesh, glbBuf, opts = {}) {
     const applyN = (n) => { const r = [it[0] * n[0] + it[1] * n[1] + it[2] * n[2], it[3] * n[0] + it[4] * n[1] + it[5] * n[2], it[6] * n[0] + it[7] * n[1] + it[8] * n[2]]; const l = Math.hypot(...r) || 1; return r.map((x) => x / l); };
     const flipWinding = det < 0; // a mirrored object turns its triangles inside out
     const groups = new Map(); // section -> primitives
-    for (const pr of obj.primitives) { const si = sectionOf(pr.material); if (!groups.has(si)) groups.set(si, []); groups.get(si).push(pr); }
+    const leftOut = new Set();
+    for (const pr of obj.primitives) {
+      if (borrowed && !ed.some((s) => s.material === strip(pr.material).replace(/__s\d+$/, ''))) { leftOut.add(strip(pr.material)); continue; }
+      const si = sectionOf(pr.material); if (!groups.has(si)) groups.set(si, []); groups.get(si).push(pr);
+    }
+    if (leftOut.size) report.push(`LOD ${li}: has no ${[...leftOut].join(', ')}; left out at this distance`);
     for (const [si, prims] of groups) {
-      const s = ed[si], pool = s.vertices, verts = [], tris = [];
+      const s = ed[si], verts = [], tris = [];
+      // templates: this part's own vertices; a part that is empty in this LOD borrows them from the same part in LOD 0
+      let pool = s.vertices;
+      if (!pool.length && li > 0) {
+        const ed0 = lod0Editable || (lod0Editable = readEditable(mesh.lods[0], lodData(index, mesh, mesh.lods[0])));
+        const twin = ed0.find((x) => x.material === s.material && x.stride === s.stride && x.vertices.length);
+        if (twin) pool = twin.vertices;
+      }
       for (const pr of prims) {
         const base = verts.length;
         pr.positions.forEach((pp, i) => {
@@ -566,7 +604,9 @@ function glbToModel(index, mesh, glbBuf, opts = {}) {
           const values = { position: [-gp[0], gp[1], gp[2]] };
           if (gn) values.normal = [-gn[0], gn[1], gn[2]];
           if (pr.uv0) values.uv0 = pr.uv0[i].slice(0, 2);
-          if (pr.uv1 || pr.uv0) values.uv1 = (pr.uv1 || pr.uv0)[i].slice(0, 2);
+          // uv1 is the game's own layout (dirt / damage / reflection masks); a .glb without a second UV set keeps the
+          // uv1 of the nearest original vertex, so each new point gets the mask of the place on the car where it is
+          if (pr.uv1) values.uv1 = pr.uv1[i].slice(0, 2);
           if (pr.tangents) values.tangent = [-pr.tangents[i][0], pr.tangents[i][1], pr.tangents[i][2]];
           verts.push(templatedVertex(s, values, pool));
         });
@@ -575,9 +615,40 @@ function glbToModel(index, mesh, glbBuf, opts = {}) {
           tris.push(flipWinding ? [t[0], t[1], t[2]] : [t[0], t[2], t[1]]); // mirroring x reverses the winding back
         }
       }
-      report.push(`LOD ${li} ${s.material}: ${s.vertices.length} -> ${verts.length} vertices, ${s.triangles.length} -> ${tris.length} triangles`);
+      // opts.evenShade: the baked shading (vertex colour) of the original part does not fit another model's shape (an
+      // outside panel next to the old engine bay came out black); give every vertex the part's usual light shade
+      const colEl = s.elements.find((e) => e.usage === 0x1e);
+      if (opts.evenShade && colEl && s.vertices.length) {
+        const shades = s.vertices.map((v) => v.raw.readUInt32LE(colEl.offset)).sort((a, b) => (a & 255) - (b & 255));
+        const light = shades[Math.floor(shades.length * 0.9)];
+        for (const v of verts) v.raw.writeUInt32LE(light, colEl.offset);
+      }
+      // one bone per triangle: a triangle whose corners took their bytes from vertices of different bones (body and
+      // bumper, ...) would stretch when the parts move apart. Its odd corners get a copy on the triangle's main bone.
+      const boneEl = s.elements.find((e) => e.usage === 2);
+      let split = 0;
+      // only for rigid parts: in the original part no triangle mixes bones (characters, flags, ... do, on purpose)
+      const rigid = boneEl && s.triangles.every((t) => { const b = t.map((i) => s.vertices[i].raw[boneEl.offset]); return b[0] === b[1] && b[1] === b[2]; });
+      if (rigid) {
+        const boneOf = (v) => v.raw[boneEl.offset], copies = new Map();
+        for (const t of tris) {
+          const b = t.map((i) => boneOf(verts[i]));
+          if (b[0] === b[1] && b[1] === b[2]) continue;
+          const main = b[0] === b[1] || b[0] === b[2] ? b[0] : b[1] === b[2] ? b[1] : b[0];
+          for (let k = 0; k < 3; k++) {
+            if (b[k] === main) continue;
+            const key = t[k] + '|' + main;
+            if (!copies.has(key)) { const nv = { ...verts[t[k]], raw: Buffer.from(verts[t[k]].raw) }; nv.raw.fill(main, boneEl.offset, boneEl.offset + 4); verts.push(nv); copies.set(key, verts.length - 1); }
+            t[k] = copies.get(key);
+          }
+          split++;
+        }
+      }
+      report.push(`LOD ${li} ${s.material}: ${s.vertices.length} -> ${verts.length} vertices, ${s.triangles.length} -> ${tris.length} triangles${split ? ` (${split} triangles put on one bone)` : ''}`);
       s.vertices = verts; s.triangles = tris;
     }
+    const keep = new Set(opts.keepParts || []); // parts kept as they are even with clearOthers (e.g. DRIVER)
+    if (opts.clearOthers) ed.forEach((s, si) => { if (!groups.has(si) && !keep.has(s.material) && s.vertices.length) { collapseSection(s); report.push(`LOD ${li} ${s.material}: hidden`); } });
     const w = writeGeometry(ed);
     ups.set(li, w); chunks.set(lod.chunk, w.data);
   });

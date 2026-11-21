@@ -142,7 +142,7 @@ function collectMods() {
     else if (kind === 'ebx') name = name.replace(/\.ebx$/, '');
     else if (kind === 'res') name = name.replace(/\.res(_[0-9a-f]+)?$/, '');
     return { file: f, kind, name };
-  }).filter((m) => ['chunk', 'ebx', 'res'].includes(m.kind));
+  }).filter((m) => ['chunk', 'ebx', 'res'].includes(m.kind) && !m.file.endsWith('.json')); // <guid>.chunk.json: hints, not mods
 }
 
 function apply() {
@@ -169,6 +169,8 @@ function apply() {
 
   for (const m of mods) {
     const raw = fs.readFileSync(m.file);
+    // a resized texture: where its streamed-later levels end (bundles that hold only the rest need it)
+    if (m.kind === 'chunk' && fs.existsSync(m.file + '.json')) raw.logicalOffset = JSON.parse(fs.readFileSync(m.file + '.json', 'utf8')).logicalOffset;
     let inToc = false;
     if (m.kind === 'chunk') {
       const hit = findTocChunk(m.name);

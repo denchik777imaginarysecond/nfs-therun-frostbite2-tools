@@ -69,3 +69,7 @@ node/
 /*.png
 /*.jpg
 /*.jpeg
+
+# --- Car ports: models from other games stay on your PC (never published) ---
+my_ports/
+/*.glb

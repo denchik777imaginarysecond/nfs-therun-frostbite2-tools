@@ -31,8 +31,10 @@
  *       { "type": "file", "kind": "ebx|res|chunk", "name": "<asset name or chunk guid>", "path": "<file in the mod>" } ] }
  * "texture" keeps the texture's size and format unless "size" is given ("png" = the picture's own size); sizes are powers
  * of two from 4 to 4096. Formats: DXT1, DXT3, DXT5, BC4, BC5 and DXT5 normal maps, L8, BGRA8 (the texture keeps its own).
- * "mesh" replaces a 3D model with a .glb (export one with: node fb2_mesh.js model <name>, edit it in Blender, export
- * as .glb). Objects "lod0", "lod1", ... replace those levels of detail; LODs without an object get lod0's. Parts are
+ * "mesh" replaces a 3D model with a .glb ("clearOthers": true hides the parts the .glb does not have, except "keepParts": [names]; "evenShade": true gives
+ * new geometry an even light baked shade instead of the old shape's; "hide": true
+ * without a .glb hides the whole model). Export one with: node fb2_mesh.js model <name>, edit it in Blender, export
+ * as .glb. Objects "lod0", "lod1", ... replace those levels of detail; LODs without an object get lod0's. Parts are
  * matched by material name. The geometry is built on the player's PC from their own game and the .glb.
  * "text" changes a text the player sees (any length; find ids with: node fb2_loc.js find <words>, or in the editor).
  * Without "lang" it is changed in every installed language.
@@ -113,7 +115,7 @@ function validateMod(m, where) {
       if (!c.asset || !c.png) bad(`${at}: texture needs "asset" and "png"`);
       if (c.size !== undefined && c.size !== 'png' && !(Array.isArray(c.size) && c.size.length === 2)) bad(`${at}: "size" is "png" or [width, height]`);
     }
-    else if (c.type === 'mesh') { if (!c.asset || !c.glb) bad(`${at}: mesh needs "asset" (model name) and "glb" (file in the mod)`); }
+    else if (c.type === 'mesh') { if (!c.asset || (!c.glb && c.hide !== true)) bad(`${at}: mesh needs "asset" (model name) and "glb" (file in the mod), or "hide": true`); }
     else if (c.type === 'text') { if (!/^(0x)?[0-9a-f]{1,8}$/i.test(String(c.id || '')) || typeof c.value !== 'string') bad(`${at}: text needs "id" (hex) and "value" (text)`); if (c.lang !== undefined && !/^[a-z]{2}$/i.test(c.lang)) bad(`${at}: "lang" must be a two-letter code like "en"`); }
     else if (c.type === 'file') { if (!['ebx', 'res', 'chunk'].includes(c.kind) || !c.name || !c.path) bad(`${at}: file needs "kind" (ebx/res/chunk), "name" and "path"`); }
     else bad(`${at}: unknown type "${c.type}"`);
@@ -259,13 +261,20 @@ function build(write) {
         const guid = hdr.toString('hex', 0x1c, 0x2c);
         claim(`chunk|${guid}`, id, c.png, `texture ${c.asset}`);
         writeOut(`chunk/${guid}.chunk`, tex.data);
-        if (tex.resized) { claim(`res|${name}`, id, c.png, `texture ${c.asset} size`); writeOut(`res/${name}.res`, tex.header); } // new size: new header too
+        if (tex.resized) {
+          claim(`res|${name}`, id, c.png, `texture ${c.asset} size`); writeOut(`res/${name}.res`, tex.header); // new size: new header too
+          // levels the game streams later (header 0x1b): some bundles keep only the rest; tell them where it starts now
+          const later = tex.header[0x1b];
+          if (later) { let off = 0; for (let m = 0; m < later; m++) off += tex.header.readUInt32LE(0x2c + m * 4); writeOut(`chunk/${guid}.chunk.json`, Buffer.from(JSON.stringify({ logicalOffset: off }))); }
+        }
       } else if (c.type === 'mesh') {
         const name = c.asset.toLowerCase();
-        const r = MESH.glbToModel(index, MESH.parseMeshSet(resAsGameSees(index, name, MESH.MESH_RES_TYPE)), fs.readFileSync(insideMod(dir, c.glb)), { keepOtherLods: !!c.keepOtherLods });
-        claim(`res|${name}`, id, c.glb, `model ${name}`);
+        const src = c.hide ? '(hidden)' : c.glb;
+        const r = MESH.glbToModel(index, MESH.parseMeshSet(resAsGameSees(index, name, MESH.MESH_RES_TYPE)), c.hide ? null : fs.readFileSync(insideMod(dir, c.glb)),
+          { keepOtherLods: !!c.keepOtherLods, clearOthers: !!c.clearOthers, keepParts: c.keepParts, hide: !!c.hide, evenShade: !!c.evenShade });
+        claim(`res|${name}`, id, src, `model ${name}`);
         writeOut(`res/${name}.res`, r.res);
-        for (const [guid, data] of r.chunks) { claim(`chunk|${guid}`, id, c.glb, `model ${name} geometry`); writeOut(`chunk/${guid}.chunk`, data); }
+        for (const [guid, data] of r.chunks) { claim(`chunk|${guid}`, id, src, `model ${name} geometry`); writeOut(`chunk/${guid}.chunk`, data); }
         meshReports.push(...r.report.map((x) => `${id}: ${name.split('/').pop()} ${x}`));
       } else if (c.type === 'text') {
         const installed = LOC.languages();

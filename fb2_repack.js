@@ -192,9 +192,25 @@ function rebuildBundle(fd, off, size, replacements = new Map()) {
       if (e.kind === 'chunk') {
         const at = lay.chunkAt(i - lay.nEbx - lay.nRes);
         const a = hb.readUInt32BE(at + 16);
-        if (a !== 0) throw new Error('chunk with a non-zero logical offset is not supported yet: ' + e.name);
-        stored = isBlockFramed(orig) ? packBlocks(raw) : raw;      // keep the original storage style
-        hb.writeUInt32BE(stored.length, at + 20);                 // B = A + stored size
+        if (a !== 0) {
+          // A partial copy: the bundle holds only the tail of the chunk (e.g. a texture without its biggest mip level,
+          // which the game streams later). Meta: A = where the tail starts in the packed full chunk, B = packed full
+          // size, C = logical offset of the tail (bytes of the levels left out). Verified on the game's own bundles.
+          const C = hb.readUInt32BE(at + 24);
+          if (!isBlockFramed(orig)) throw new Error('chunk with a non-zero logical offset is not block-packed: ' + e.name);
+          const oldFull = C + L.unpackBlocks(orig).length;
+          const newC = raw.logicalOffset !== undefined ? raw.logicalOffset : raw.length === oldFull ? C : null;
+          if (newC === null) throw new Error(`chunk ${e.name}: a partial copy needs the new logical offset (size changed: ${oldFull} -> ${raw.length})`);
+          const packed = packBlocks(raw);
+          let p = 0, logical = 0;
+          while (logical < newC && p < packed.length) { logical += packed.readUInt32BE(p); p += 8 + packed.readUInt16BE(p + 6); }
+          if (logical !== newC) throw new Error(`chunk ${e.name}: the tail does not start on a block border (${newC})`);
+          stored = packed.subarray(p);
+          hb.writeUInt32BE(p, at + 16); hb.writeUInt32BE(packed.length, at + 20); hb.writeUInt32BE(newC, at + 24);
+        } else {
+          stored = isBlockFramed(orig) ? packBlocks(raw) : raw;      // keep the original storage style
+          hb.writeUInt32BE(stored.length, at + 20);                 // B = A + stored size
+        }
       } else {
         const wasRaw = e.size === e.orig;
         stored = wasRaw ? raw : packBlocks(raw);
