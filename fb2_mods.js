@@ -117,6 +117,7 @@ function validateMod(m, where) {
     }
     else if (c.type === 'mesh') { if (!c.asset || (!c.glb && c.hide !== true)) bad(`${at}: mesh needs "asset" (model name) and "glb" (file in the mod), or "hide": true`); }
     else if (c.type === 'text') { if (!/^(0x)?[0-9a-f]{1,8}$/i.test(String(c.id || '')) || typeof c.value !== 'string') bad(`${at}: text needs "id" (hex) and "value" (text)`); if (c.lang !== undefined && !/^[a-z]{2}$/i.test(c.lang)) bad(`${at}: "lang" must be a two-letter code like "en"`); }
+    else if (c.type === 'add') { if (!c.next || !Array.isArray(c.add) || !c.add.length || c.add.some((x) => typeof x !== 'string')) bad(`${at}: add needs "next" (ebx name) and "add" (a list of asset names)`); }
     else if (c.type === 'file') { if (!['ebx', 'res', 'chunk'].includes(c.kind) || !c.name || !c.path) bad(`${at}: file needs "kind" (ebx/res/chunk), "name" and "path"`); }
     else bad(`${at}: unknown type "${c.type}"`);
   });
@@ -150,6 +151,54 @@ function install(src) {
 
 // ------------------------------------------------------------------ build: turn enabled mods into game-file mods for fb2_patch
 const resAsGameSees = (index, name, type) => MESH.resAsGameSees(index, name, type); // shared with the editor
+
+// ------------------------------------------------------------------ build cache
+// Building a model or a texture takes up to a second; with two cars that is a minute every time. A result is kept in
+// output/cache under a key made of everything it depends on: the change itself, the bytes of the mod's file (.glb /
+// .png), the game (the asset index: rebuilt when the game changes) and the code that builds it. Same key = same result.
+const crypto = require('crypto');
+const CACHE = path.join(OUT, 'cache');
+const sha1 = (b) => crypto.createHash('sha1').update(b).digest('hex');
+let stamps = null;
+function cacheStamps() {
+  if (stamps) return stamps;
+  const st = fs.statSync(L.INDEX_FILE);
+  const code = ['fb2_mesh.js', 'fb2_tex_import.js', 'fb2_texture.js', 'fb2_extract.js', 'fb2_repack.js'].map((f) => sha1(fs.readFileSync(path.join(TOOL, f)))).join('');
+  stamps = sha1(`${st.size}|${st.mtimeMs}|${code}`);
+  return stamps;
+}
+const fileHashes = new Map(); // a mod file's bytes are hashed once per run
+const fileHash = (f) => { if (!fileHashes.has(f)) fileHashes.set(f, sha1(fs.readFileSync(f))); return fileHashes.get(f); };
+const cacheKey = (kind, change, file) => sha1([kind, cacheStamps(), JSON.stringify(change), file ? fileHash(file) : ''].join('|'));
+function cacheGet(key) {
+  const d = path.join(CACHE, key.slice(0, 2), key);
+  if (!fs.existsSync(path.join(d, 'meta.json'))) return null;
+  try {
+    const meta = JSON.parse(fs.readFileSync(path.join(d, 'meta.json'), 'utf8'));
+    const now = new Date(); try { fs.utimesSync(path.join(d, 'meta.json'), now, now); } catch { /* only for clean-up */ } // last used
+    return { meta, read: (n) => fs.readFileSync(path.join(d, n)) };
+  } catch { return null; }
+}
+function cachePut(key, meta, files) {
+  const d = path.join(CACHE, key.slice(0, 2), key), tmp = d + '.tmp' + process.pid;
+  try {
+    fs.mkdirSync(tmp, { recursive: true });
+    for (const [n, data] of Object.entries(files)) fs.writeFileSync(path.join(tmp, n), data);
+    fs.writeFileSync(path.join(tmp, 'meta.json'), JSON.stringify(meta)); // written last: a half-written entry has no meta
+    fs.rmSync(d, { recursive: true, force: true }); fs.renameSync(tmp, d);
+  } catch { fs.rmSync(tmp, { recursive: true, force: true }); } // the cache is only a speed-up: never fail the build for it
+}
+// entries not used for 30 days are removed, so the cache does not grow for ever
+function cachePrune() {
+  if (!fs.existsSync(CACHE)) return;
+  const old = Date.now() - 30 * 24 * 3600 * 1000;
+  for (const a of fs.readdirSync(CACHE)) for (const k of fs.readdirSync(path.join(CACHE, a))) {
+    const d = path.join(CACHE, a, k);
+    try { if (fs.statSync(path.join(d, 'meta.json')).mtimeMs < old) fs.rmSync(d, { recursive: true, force: true }); } catch { fs.rmSync(d, { recursive: true, force: true }); } // no meta = half written
+  }
+}
+const pngs = new Map(); // a picture used by many textures (a livery) is read once
+const readPngOnce = (f) => { if (!pngs.has(f)) pngs.set(f, TI.readPng(f)); return pngs.get(f); };
 
 function build(write) {
   loadGame();
@@ -251,31 +300,54 @@ function build(write) {
           }
         }
       } else if (c.type === 'texture') {
-        const name = c.asset.toLowerCase();
-        let hdr;
-        try { hdr = MESH.resAsGameSees(index, name, '5c4954a6'); } catch { throw new Error(`${id}: texture not found: ${c.asset}`); } // header as the game sees it
-        const img = TI.readPng(insideMod(dir, c.png));
-        let tex;
-        try { tex = TI.buildTextureChunk(hdr, img, c.size ? { size: c.size === 'png' ? [img.w, img.h] : c.size } : {}); }
-        catch (err) { throw new Error(`${id}: texture ${c.asset}: ${err.message}`); }
-        const guid = hdr.toString('hex', 0x1c, 0x2c);
-        claim(`chunk|${guid}`, id, c.png, `texture ${c.asset}`);
-        writeOut(`chunk/${guid}.chunk`, tex.data);
-        if (tex.resized) {
-          claim(`res|${name}`, id, c.png, `texture ${c.asset} size`); writeOut(`res/${name}.res`, tex.header); // new size: new header too
-          // levels the game streams later (header 0x1b): some bundles keep only the rest; tell them where it starts now
+        const name = c.asset.toLowerCase(), pngFile = insideMod(dir, c.png);
+        const key = cacheKey('texture', { asset: name, size: c.size || null }, pngFile);
+        let hit = cacheGet(key);
+        if (!hit) {
+          let hdr;
+          try { hdr = MESH.resAsGameSees(index, name, '5c4954a6'); } catch { throw new Error(`${id}: texture not found: ${c.asset}`); } // header as the game sees it
+          const img = readPngOnce(pngFile);
+          let tex;
+          try { tex = TI.buildTextureChunk(hdr, img, c.size ? { size: c.size === 'png' ? [img.w, img.h] : c.size } : {}); }
+          catch (err) { throw new Error(`${id}: texture ${c.asset}: ${err.message}`); }
+          // levels the game streams later (header 0x1b): some bundles keep only the rest. Every copy is packed with a
+          // block border where that rest starts (as the game does), so the patcher is told where it is, resized or not
           const later = tex.header[0x1b];
-          if (later) { let off = 0; for (let m = 0; m < later; m++) off += tex.header.readUInt32LE(0x2c + m * 4); writeOut(`chunk/${guid}.chunk.json`, Buffer.from(JSON.stringify({ logicalOffset: off }))); }
+          let off = 0; for (let m = 0; m < later; m++) off += tex.header.readUInt32LE(0x2c + m * 4);
+          const meta = { guid: hdr.toString('hex', 0x1c, 0x2c), resized: !!tex.resized, logicalOffset: later ? off : null };
+          cachePut(key, meta, { 'chunk.bin': tex.data, ...(tex.resized ? { 'header.bin': tex.header } : {}) });
+          hit = { meta, read: (n) => (n === 'chunk.bin' ? tex.data : tex.header) };
         }
+        const { guid, resized, logicalOffset } = hit.meta;
+        claim(`chunk|${guid}`, id, c.png, `texture ${c.asset}`);
+        writeOut(`chunk/${guid}.chunk`, hit.read('chunk.bin'));
+        if (resized) { claim(`res|${name}`, id, c.png, `texture ${c.asset} size`); writeOut(`res/${name}.res`, hit.read('header.bin')); } // new size: new header too
+        if (logicalOffset !== null) writeOut(`chunk/${guid}.chunk.json`, Buffer.from(JSON.stringify({ logicalOffset })));
       } else if (c.type === 'mesh') {
         const name = c.asset.toLowerCase();
-        const src = c.hide ? '(hidden)' : c.glb;
-        const r = MESH.glbToModel(index, MESH.parseMeshSet(resAsGameSees(index, name, MESH.MESH_RES_TYPE)), c.hide ? null : fs.readFileSync(insideMod(dir, c.glb)),
-          { keepOtherLods: !!c.keepOtherLods, clearOthers: !!c.clearOthers, keepParts: c.keepParts, hide: !!c.hide, evenShade: !!c.evenShade });
+        const src = c.hide ? '(hidden)' : c.glb, glbFile = c.hide ? null : insideMod(dir, c.glb);
+        const opts = { keepOtherLods: !!c.keepOtherLods, clearOthers: !!c.clearOthers, keepParts: c.keepParts, hide: !!c.hide, evenShade: !!c.evenShade };
+        const key = cacheKey('mesh', { asset: name, ...opts }, glbFile);
+        let r;
+        const hit = cacheGet(key);
+        if (hit) r = { res: hit.read('res.bin'), chunks: new Map(hit.meta.chunks.map((g) => [g, hit.read(g + '.bin')])), report: hit.meta.report };
+        else {
+          r = MESH.glbToModel(index, MESH.parseMeshSet(resAsGameSees(index, name, MESH.MESH_RES_TYPE)), glbFile ? fs.readFileSync(glbFile) : null, opts);
+          cachePut(key, { chunks: [...r.chunks.keys()], report: r.report }, { 'res.bin': r.res, ...Object.fromEntries([...r.chunks].map(([g, d]) => [g + '.bin', d])) });
+        }
         claim(`res|${name}`, id, src, `model ${name}`);
         writeOut(`res/${name}.res`, r.res);
         for (const [guid, data] of r.chunks) { claim(`chunk|${guid}`, id, src, `model ${name} geometry`); writeOut(`chunk/${guid}.chunk`, data); }
         meshReports.push(...r.report.map((x) => `${id}: ${name.split('/').pop()} ${x}`));
+      } else if (c.type === 'add') {
+        // { "type": "add", "next": "<ebx name>", "add": ["<asset name>", ...] }: put those assets (with their picture
+        // data) into every bundle that holds "next", e.g. a vinyl picture for a livery that had none
+        if (!c.next || !Array.isArray(c.add) || !c.add.length) throw new Error(`${id}: "add" needs "next" and a list "add"`);
+        const next = c.next.toLowerCase(), list = c.add.map((x) => x.toLowerCase());
+        if (!index.some((e) => e.kind === 'ebx' && e.name === next)) throw new Error(`${id}: ${c.next} not found in the game`);
+        for (const n of list) if (!index.some((e) => e.kind === 'ebx' && e.name === n)) throw new Error(`${id}: ${n} not found in the game`);
+        for (const n of list) claim(`add|${next}|${n}`, id, true, `${n} next to ${next}`);
+        writeOut(`adds/${sha1(next + '|' + list.join('|')).slice(0, 16)}.json`, Buffer.from(JSON.stringify({ next, add: list })));
       } else if (c.type === 'text') {
         const installed = LOC.languages();
         const langs = c.lang ? [c.lang.toLowerCase()] : installed;
@@ -305,6 +377,7 @@ function build(write) {
     writeOut(`chunk/${r.strId}.chunk`, r.str);
     if (r.chars) writeOut(`chunk/${r.charsId}.chunk`, r.chars);
   }
+  if (write) cachePrune();
   return { enabled, count, conflicts, outDir, meshReports };
 }
 
@@ -348,9 +421,20 @@ function apply() {
     console.log('No enabled mods: the game runs with its original files.');
     return;
   }
+  // the build's fingerprint: every file it wrote (name + bytes). Same as for the package in the game: nothing to do
+  const files = [];
+  const walk = (d) => { for (const x of fs.readdirSync(d, { withFileTypes: true })) { const f = path.join(d, x.name); if (x.isDirectory()) walk(f); else files.push(f); } };
+  walk(r.outDir);
+  const digest = sha1(files.sort().map((f) => path.relative(r.outDir, f) + ':' + sha1(fs.readFileSync(f))).join('\n'));
+  const digestFile = path.join(PKG_DIR(), 'mods_build.sha1');
+  if (!DRY && fs.existsSync(path.join(PKG_DIR(), 'package.mft')) && fs.existsSync(digestFile) && fs.readFileSync(digestFile, 'utf8') === digest) {
+    console.log('Nothing changed since the last apply: the game already has these mods.');
+    return;
+  }
   console.log(`Applying ${r.enabled.length} mod(s): ${r.enabled.join(', ')}`);
   // mods go into a separate update package (Update/Mods); the game's own files are never changed
   if (!runPatch('apply', '--mods', r.outDir, '--package', PKG_DIR(), ...(DRY ? ['--dry-run'] : []))) throw new Error('fb2_patch failed');
+  if (!DRY) fs.writeFileSync(digestFile, digest);
   if (!DRY) console.log('Done. Start the game. Undo everything with: restore');
 }
 function restoreAll() {
@@ -377,6 +461,7 @@ async function menu() {
     console.log('  number    switch that mod on/off');
     console.log('  R number  remove it (e.g. R2)');
     console.log('  U number  move it up (later mods win when two change the same thing)');
+    console.log('  C         add a car model (.glb) in place of a car of the game');
     console.log('  A         apply to the game' + (pending ? '   <- your changes are not in the game yet' : ''));
     console.log('  Q         quit');
     const a = (await ask('> ')).trim().toUpperCase();
@@ -389,14 +474,65 @@ async function menu() {
     } else if (m && m[1] === 'U') {
       const i = l.order.indexOf(pick);
       if (i > 0) { l.order.splice(i, 1); l.order.splice(i - 1, 0, pick); saveList(l); pending = true; }
+    } else if (a === 'C') {
+      try { if (await addCarModel(ask)) pending = true; } catch (err) { console.log('ERROR: ' + err.message); }
     } else if (a === 'A') {
       try { apply(); pending = false; } catch (err) { console.log('ERROR: ' + err.message); }
     } else if (a === 'Q' || a === '') {
       if (pending && await yes('  Your changes are not in the game yet. Apply them now?')) { try { apply(); } catch (err) { console.log('ERROR: ' + err.message); } }
       break;
-    } else console.log('  Type a number, R and a number, U and a number, A or Q.');
+    } else console.log('  Type a number, R and a number, U and a number, C, A or Q.');
   }
   rl.close();
+}
+
+// The cars a model can replace: id -> the name the garage shows (cars that have a main body kit)
+function gameCars(index) {
+  const ids = [...new Set(index.filter((e) => e.kind === 'res' && /^_c4\/vehicles\/nfs\/([^/]+)\/kits\/\1_kit00_stream_meshbody$/.test(e.name)).map((e) => e.name.split('/')[3]))];
+  const shown = new Map();
+  for (const e of index) {
+    if (e.kind !== 'ebx' || !e.name.startsWith('_c4/gameplay/garage/')) continue;
+    const id = ids.find((x) => e.name.split('/').pop().startsWith(x + '_') || e.name.split('/').pop() === x);
+    if (!id || shown.has(id)) continue;
+    try { const v = W.decode(E.readAsGameSees(index, e.name).data).instances[0].value; if (v && v.DisplayString) shown.set(id, v.DisplayString); } catch { /* not a garage car */ }
+  }
+  // cars without a garage name (add-ons, police): a readable name from the id, e.g. for_mus_bos_12 -> Ford mus bos 2012
+  const MAKES = { ast: 'Aston Martin', aud: 'Audi', bmw: 'BMW', bug: 'Bugatti', che: 'Chevrolet', cop: 'Police', dod: 'Dodge', for: 'Ford (Mustang)', gum: 'Gumpert', hen: 'Hennessey', koe: 'Koenigsegg', lam: 'Lamborghini', lex: 'Lexus', lot: 'Lotus', maz: 'Mazda', mcl: 'McLaren', mer: 'Mercedes-Benz', mit: 'Mitsubishi', nis: 'Nissan', pag: 'Pagani', pon: 'Pontiac', por: 'Porsche', ren: 'Renault', she: 'Shelby (Mustang)', sub: 'Subaru', toy: 'Toyota', vol: 'Volkswagen' };
+  const guess = (id) => { const p = id.split('_'), y = Number(p[p.length - 1]); return [MAKES[p[0]] || p[0], ...p.slice(1, -1), Number.isFinite(y) ? (y > 30 ? 1900 + y : 2000 + y) : p[p.length - 1]].join(' '); };
+  return ids.map((id) => ({ id, name: shown.get(id) || guess(id) })).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// Menu "C": a car model (.glb) in place of a car of the game. The model is copied to my_ports/<name>-on-<car>, a
+// port.json is written for it automatically (fb2_carport.js auto) and the mod is built and installed (switched on).
+async function addCarModel(ask) {
+  loadGame();
+  if (!fs.existsSync(L.INDEX_FILE)) { console.log('Building the asset index (first run only)...'); L.buildIndex(); }
+  const index = L.loadIndex();
+  const file = (await ask('  Drag your car model (.glb) into this window, then press Enter: ')).trim().replace(/^"|"$/g, '');
+  if (!file || file.toUpperCase() === 'Q') return false;
+  if (!fs.existsSync(file) || !/\.glb$/i.test(file)) { console.log('  That is not a .glb file. In Blender: File > Export > glTF 2.0, format "glTF Binary (.glb)".'); return false; }
+  console.log('  Reading the cars of the game...');
+  const cars = gameCars(index);
+  const q = (await ask('  Which car of the game should it replace? Type part of its name (e.g. camaro): ')).trim().toLowerCase();
+  const found = cars.filter((c) => (c.name + ' ' + c.id).toLowerCase().includes(q)).slice(0, 30);
+  if (!found.length) { console.log('  No car of the game matches "' + q + '".'); return false; }
+  found.forEach((c, i) => console.log(`  ${String(i + 1).padStart(2)}. ${c.name}  (${c.id})`));
+  const n = Number((await ask('  Number of the car: ')).trim());
+  const car = found[n - 1];
+  if (!car) { console.log('  No such number.'); return false; }
+  const dir = path.join(TOOL, 'my_ports', slug(path.basename(file, path.extname(file))) + '-on-' + car.id);
+  fs.mkdirSync(dir, { recursive: true });
+  const glb = path.join(dir, path.basename(file));
+  if (path.resolve(file) !== path.resolve(glb)) fs.copyFileSync(file, glb);
+  console.log(`  Fitting the model onto the ${car.name} (this takes a few minutes)...`);
+  const r = spawnSync(process.execPath, ['--max-old-space-size=8192', path.join(TOOL, 'fb2_carport.js'), '--game', GAME, 'auto', glb, car.id], { stdio: 'inherit' });
+  if (r.status !== 0) { console.log('  The model could not be fitted (see the message above). Its settings are in ' + path.join(dir, 'port.json')); return false; }
+  install(path.join(dir, 'mod'));
+  console.log('');
+  console.log(`  Done: the model replaces the ${car.name}. Lines starting with CHECK above say what to look at in the game.`);
+  console.log('  Press A to put it in the game. To fine-tune it, edit ' + path.join(dir, 'port.json'));
+  console.log('  and add the model again. Please do not share models taken from other games.');
+  return true;
 }
 
 function newMod(name) {

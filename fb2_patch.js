@@ -12,6 +12,9 @@
  *   mods/chunk/<32-hex guid>.chunk          replaces a chunk (in a .toc chunk list or inside a bundle)
  *   mods/ebx/<asset path>.ebx               replaces an ebx in every bundle that contains it
  *   mods/res/<asset path>.res[_<type>]      replaces a res in every bundle that contains it
+ *   mods/adds/<any>.json                    { "next": "<ebx name>", "add": ["<asset name>", ...] }: copies those assets
+ *                                           (ebx, res of the same name, the chunks the res uses) from a bundle that
+ *                                           has them into every bundle that holds "next" (e.g. a picture for a livery)
  *   (ebx/res and bundle chunks need the asset index: node fb2_extract.js --game "<game dir>" index)
  *
  * Safety:
@@ -144,10 +147,15 @@ function collectMods() {
     return { file: f, kind, name };
   }).filter((m) => ['chunk', 'ebx', 'res'].includes(m.kind) && !m.file.endsWith('.json')); // <guid>.chunk.json: hints, not mods
 }
+function collectAdds() {
+  const d = path.join(MODS, 'adds');
+  if (!fs.existsSync(d)) return [];
+  return fs.readdirSync(d).filter((f) => f.endsWith('.json')).map((f) => JSON.parse(fs.readFileSync(path.join(d, f), 'utf8')));
+}
 
 function apply() {
-  const mods = collectMods();
-  if (!mods.length) { console.log('No mods found in', MODS); return; }
+  const mods = collectMods(), adds = collectAdds();
+  if (!mods.length && !adds.length) { console.log('No mods found in', MODS); return; }
   if (PKG) {
     // the package is built from the ORIGINAL official patch, so the game's own files must not be patched in place
     if (Object.keys(loadState().files).length) throw new Error('the game files are patched in place; run "restore" first');
@@ -191,6 +199,47 @@ function apply() {
       bundleJobs.get(key).repl.set(m.kind + ':' + m.name, raw);
     }
   }
+  // assets copied into other bundles: where they come from, and the bundles that get them
+  if (adds.length) {
+    const modRaw = new Map(mods.map((m) => [m.kind + ':' + m.name, m]));
+    const sources = new Map(); // bundle -> parsed (each read once)
+    const parsed = (e) => {
+      const k = e.sb + '|' + e.bundle;
+      if (!sources.has(k)) {
+        const t = R.tocBundles(toc(path.join(L.DATA_DIR, e.sb.replace(/\.sb$/i, '.toc')))).find((b) => R.entryId(b) === e.bundle);
+        if (!t) throw new Error('bundle not found: ' + e.bundle);
+        sources.set(k, R.parseBundle(readAt(path.join(L.DATA_DIR, e.sb), R.numOf(R.child(t, 'offset')), R.numOf(R.child(t, 'size')))));
+      }
+      return sources.get(k);
+    };
+    for (const a of adds) {
+      const next = a.next.toLowerCase();
+      const targets = getIndex().filter((e) => e.kind === 'ebx' && e.name.toLowerCase() === next);
+      if (!targets.length) throw new Error(`adds: "${a.next}" not found in the game`);
+      const list = [];
+      for (const name of a.add.map((x) => x.toLowerCase())) {
+        const src = getIndex().find((e) => e.kind === 'ebx' && e.name.toLowerCase() === name);
+        if (!src) throw new Error(`adds: "${name}" not found in the game`);
+        const from = parsed(src);
+        list.push({ from, kind: 'ebx', name });
+        const res = from.entries.find((x) => x.kind === 'res' && x.name.toLowerCase() === name);
+        if (res) {
+          list.push({ from, kind: 'res', name });
+          const data = res.size === res.orig ? res.data : L.unpackBlocks(res.data);
+          const hex = data.toString('hex');
+          for (const c of from.entries.filter((x) => x.kind === 'chunk')) if (hex.includes(c.name)) list.push({ from, kind: 'chunk', name: c.name });
+        }
+      }
+      for (const e of targets) {
+        const key = e.sb + '|' + e.bundle;
+        if (!bundleJobs.has(key)) bundleJobs.set(key, { sbFile: path.join(L.DATA_DIR, e.sb), sbRel: e.sb, bundleId: e.bundle, repl: new Map() });
+        const job = bundleJobs.get(key);
+        job.adds = [...(job.adds || []), ...list];
+        // the copies get the mods' versions too (e.g. a new picture)
+        for (const x of list) { const m = modRaw.get(x.kind + ':' + x.name); if (m) { const raw = fs.readFileSync(m.file); if (m.kind === 'chunk' && fs.existsSync(m.file + '.json')) raw.logicalOffset = JSON.parse(fs.readFileSync(m.file + '.json', 'utf8')).logicalOffset; job.repl.set(x.kind + ':' + x.name, raw); } }
+      }
+    }
+  }
   const chunkOnly = (job) => [...job.repl.keys()].every((k) => k.startsWith('chunk:'));
 
   // check bundles against the official patch before writing anything
@@ -211,7 +260,7 @@ function apply() {
   for (const [k, job] of bundleJobs) if (job.skip) bundleJobs.delete(k);
   console.log(`${DRY ? 'Plan (dry run)' : 'Applying'}: ${plan.length} toc chunk(s), ${bundleJobs.size} bundle(s)`);
   for (const p of plan) console.log(`  chunk ${p.m.name} -> ${p.where}`);
-  for (const j of bundleJobs.values()) console.log(`  bundle ${j.bundleId} (${j.deltaToc ? 'official patch delta -> new delta in patch .sb' : j.sbRel + (j.patchToc ? ', also patch toc' : '')}) <- ${[...j.repl.keys()].join(', ')}`);
+  for (const j of bundleJobs.values()) console.log(`  bundle ${j.bundleId} (${j.deltaToc ? 'official patch delta -> new delta in patch .sb' : j.sbRel + (j.patchToc ? ', also patch toc' : '')}) <- ${[...j.repl.keys()].join(', ')}${j.adds ? ' + adds ' + j.adds.map((x) => x.kind + ':' + x.name).join(', ') : ''}`);
   if (DRY) return;
 
   // 1) chunks listed directly in a .toc
@@ -219,7 +268,7 @@ function apply() {
     let e = p.hit.entry, tocFile = p.hit.tocFile, sbFile = p.hit.sbFile;
     const origSize = R.numOf(R.child(e, 'size'));
     const orig = readAt(p.hit.sbFile, R.numOf(R.child(e, 'offset')), Math.min(64, origSize));
-    const stored = R.isBlockFramed(orig, origSize) ? R.packBlocks(p.raw) : p.raw; // keep the original storage style
+    const stored = R.isBlockFramed(orig, origSize) ? R.packChunk(p.raw) : p.raw; // keep the original storage style (and the tail border)
     if (PKG && tocFile.startsWith(L.DATA_DIR + path.sep)) {
       // the chunk lives in a base toc: patch tocs list only new/changed chunks, so add an entry to the package copy
       tocFile = path.join(PD, path.relative(L.DATA_DIR, tocFile));
@@ -241,7 +290,7 @@ function apply() {
     const pe = R.tocBundles(toc(job.deltaToc)).find((b) => R.entryId(b).toLowerCase() === job.bundleId.toLowerCase());
     const pSb = job.deltaToc.replace(/\.toc$/i, '.sb');
     const res = R.rebuildDeltaBundle(pSb, R.numOf(R.child(pe, 'offset')), R.numOf(R.child(pe, 'size')), job.sbFile, COMMON,
-      (e) => job.repl.get(e.kind + ':' + e.name.toLowerCase()) || null);
+      (e) => job.repl.get(e.kind + ':' + e.name.toLowerCase()) || null, job.adds);
     if (res.replaced !== job.repl.size) throw new Error('could not locate every asset inside the patched ' + job.bundleId);
     protectToc(state, job.deltaToc); protectSb(state, pSb);
     const newOff = R.appendToSb(pSb, res.delta);
@@ -259,6 +308,21 @@ function apply() {
     const info = L.readBundle(fd, off, size);
     const replacements = new Map();
     info.entries.forEach((e, i) => { const r = job.repl.get(e.kind + ':' + e.name.toLowerCase()); if (r) replacements.set(i, r); });
+    if (job.adds) {
+      // the bundle gets new entries: everything is done on the grown copy (package mode)
+      fs.closeSync(fd);
+      if (!PKG) throw new Error(job.bundleId + ': adding assets to a bundle needs package mode');
+      const res = R.rebuildBaseAsDelta(job.sbFile, off, size, COMMON, (e) => job.repl.get(e.kind + ':' + e.name.toLowerCase()) || null, job.adds);
+      if (res.replaced !== job.repl.size) throw new Error('could not locate every asset inside ' + job.bundleId);
+      const pe = R.tocBundles(toc(job.patchToc)).find((b) => R.entryId(b).toLowerCase() === job.bundleId.toLowerCase());
+      const flagN = R.child(pe, 'base');
+      if (!flagN) throw new Error('unexpected patch toc entry for ' + job.bundleId);
+      flagN.name = Buffer.from('delta', 'latin1');
+      const newOff = R.appendToSb(job.patchToc.replace(/\.sb$/i, '.sb').replace(/\.toc$/i, '.sb'), res.delta);
+      R.setNum(R.child(pe, 'offset'), newOff); R.setNum(R.child(pe, 'size'), res.delta.length);
+      dirty.add(job.patchToc);
+      continue;
+    }
     if (replacements.size !== job.repl.size) { fs.closeSync(fd); throw new Error('could not locate every asset inside ' + job.bundleId); }
     // trimmed chunk copies (logical offset != 0) are not supported yet: skip them, keep the rest
     const hb4 = Buffer.alloc(4); fs.readSync(fd, hb4, 0, 4, off);

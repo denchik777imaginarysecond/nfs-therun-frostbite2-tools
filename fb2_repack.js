@@ -119,6 +119,13 @@ const entryFlag = (e, f) => { const n = child(e, f); return !!(n && n.v); };
 
 // Same framing as unpackBlocks(): 64 KB pieces, zlib (type 0). A piece whose packed form would not fit
 // the 16-bit size field is split in half until it does.
+// A chunk packed the way the game packs streamed textures: when raw.logicalOffset is set (the levels streamed
+// later end there), a new block starts exactly at that offset, so bundles that hold only the tail can point at it.
+function packChunk(raw, split = raw.logicalOffset) {
+  if (!split || split >= raw.length) return packBlocks(raw);
+  return Buffer.concat([packBlocks(raw.subarray(0, split)), packBlocks(raw.subarray(split))]);
+}
+
 function packBlocks(data, blockSize = 0x10000) {
   const parts = [];
   const emit = (piece) => {
@@ -201,14 +208,14 @@ function rebuildBundle(fd, off, size, replacements = new Map()) {
           const oldFull = C + L.unpackBlocks(orig).length;
           const newC = raw.logicalOffset !== undefined ? raw.logicalOffset : raw.length === oldFull ? C : null;
           if (newC === null) throw new Error(`chunk ${e.name}: a partial copy needs the new logical offset (size changed: ${oldFull} -> ${raw.length})`);
-          const packed = packBlocks(raw);
+          const packed = packChunk(raw, newC);
           let p = 0, logical = 0;
           while (logical < newC && p < packed.length) { logical += packed.readUInt32BE(p); p += 8 + packed.readUInt16BE(p + 6); }
           if (logical !== newC) throw new Error(`chunk ${e.name}: the tail does not start on a block border (${newC})`);
           stored = packed.subarray(p);
           hb.writeUInt32BE(p, at + 16); hb.writeUInt32BE(packed.length, at + 20); hb.writeUInt32BE(newC, at + 24);
         } else {
-          stored = isBlockFramed(orig) ? packBlocks(raw) : raw;      // keep the original storage style
+          stored = isBlockFramed(orig) ? packChunk(raw) : raw;       // keep the original storage style (and the tail border)
           hb.writeUInt32BE(stored.length, at + 20);                 // B = A + stored size
         }
       } else {
@@ -228,6 +235,86 @@ function rebuildBundle(fd, off, size, replacements = new Map()) {
   const end = Math.ceil(pos / 16) * 16;
   if (end > pos) parts.push(Buffer.alloc(end - pos));
   return Buffer.concat(parts);
+}
+
+// ============================================================ adding assets to a bundle ===
+// The whole bundle header, as lists:
+//   [u32 hsize][magic][total][nEbx][nRes][nChunk][names at][chunkMeta at][chunkMeta size]   (offsets from byte 4)
+//   sha1 per entry (20) | ebx + res: name at, stored size, unpacked size (12) | res type (4) | res meta (16)
+//   | chunk: GUID, A, B, C (28) | chunkMeta (a DbObject list, one item per chunk: h32, meta{firstMip}) | names
+function parseBundle(buf) {
+  const hsize = buf.readUInt32BE(0), lay = bundleLayout(buf);
+  const strBase = 4 + buf.readUInt32BE(24), metaAt = buf.readUInt32BE(28), metaSize = buf.readUInt32BE(32);
+  const name = (o) => buf.toString('latin1', strBase + o, buf.indexOf(0, strBase + o));
+  const resAt = 36 + lay.total * 20 + (lay.nEbx + lay.nRes) * 12;
+  const metaNode = metaSize ? dbRead(buf.subarray(4 + metaAt, 4 + metaAt + metaSize)).root : null;
+  const meta = metaNode ? metaNode.v : [];
+  if (meta.length !== lay.nChunk) throw new Error(`bundle has ${lay.nChunk} chunks but ${meta.length} chunkMeta items`);
+  const entries = [];
+  for (let i = 0; i < lay.total; i++) {
+    const e = { sha1: Buffer.from(buf.subarray(lay.sha1At(i), lay.sha1At(i) + 20)) };
+    if (i < lay.nEbx + lay.nRes) {
+      const at = lay.namedAt(i);
+      Object.assign(e, { kind: i < lay.nEbx ? 'ebx' : 'res', name: name(buf.readUInt32BE(at)), size: buf.readUInt32BE(at + 4), orig: buf.readUInt32BE(at + 8) });
+      if (e.kind === 'res') { const r = i - lay.nEbx; e.resType = Buffer.from(buf.subarray(resAt + r * 4, resAt + r * 4 + 4)); e.resMeta = Buffer.from(buf.subarray(resAt + lay.nRes * 4 + r * 16, resAt + lay.nRes * 4 + r * 16 + 16)); }
+    } else {
+      const j = i - lay.nEbx - lay.nRes, at = lay.chunkAt(j);
+      const g = Buffer.from(buf.subarray(at, at + 16)); g.subarray(0, 4).reverse(); g.subarray(4, 6).reverse(); g.subarray(6, 8).reverse();
+      Object.assign(e, { kind: 'chunk', name: g.toString('hex'), chunk: Buffer.from(buf.subarray(at, at + 28)), size: buf.readUInt32BE(at + 20) - buf.readUInt32BE(at + 16), meta: meta[j] });
+    }
+    entries.push(e);
+  }
+  let pos = 4 + hsize;
+  for (const e of entries) { pos = Math.ceil(pos / 16) * 16; e.data = Buffer.from(buf.subarray(pos, pos + e.size)); pos += e.size; }
+  return { magic: buf.readUInt32BE(4), metaNode, entries };
+}
+
+function writeBundle(b) {
+  const es = ['ebx', 'res', 'chunk'].flatMap((k) => b.entries.filter((e) => e.kind === k));
+  const nEbx = es.filter((e) => e.kind === 'ebx').length, nRes = es.filter((e) => e.kind === 'res').length, nChunk = es.length - nEbx - nRes;
+  const names = [], nameAt = new Map();
+  let strLen = 0;
+  for (const e of es) if (e.kind !== 'chunk' && !nameAt.has(e.name)) { nameAt.set(e.name, strLen); names.push(Buffer.from(e.name + ' ', 'latin1')); strLen += e.name.length + 1; }
+  const parts = [Buffer.alloc(36)];
+  parts.push(...es.map((e) => e.sha1));
+  for (const e of es) if (e.kind !== 'chunk') { const x = Buffer.alloc(12); x.writeUInt32BE(nameAt.get(e.name), 0); x.writeUInt32BE(e.size, 4); x.writeUInt32BE(e.orig, 8); parts.push(x); }
+  parts.push(...es.filter((e) => e.kind === 'res').map((e) => e.resType), ...es.filter((e) => e.kind === 'res').map((e) => e.resMeta));
+  for (const e of es.filter((x) => x.kind === 'chunk')) { const c = Buffer.from(e.chunk); c.writeUInt32BE(c.readUInt32BE(16) + e.size, 20); parts.push(c); } // B = A + stored size
+  let metaAt = 0, metaSize = 0;
+  if (nChunk) {
+    const items = es.filter((e) => e.kind === 'chunk').map((e) => e.meta);
+    const node = b.metaNode ? { ...b.metaNode, v: items } : { t: T_LIST, name: Buffer.from('chunkMeta', 'latin1'), v: items };
+    const m = dbWrite(node);
+    metaAt = parts.reduce((t, p) => t + p.length, 0) - 4; metaSize = m.length; parts.push(m);
+  }
+  const strAt = parts.reduce((t, p) => t + p.length, 0) - 4;
+  parts.push(...names);
+  let head = Buffer.concat(parts);
+  head = Buffer.concat([head, Buffer.alloc(Math.ceil(head.length / 16) * 16 - head.length)]); // data starts 16-aligned
+  head.writeUInt32BE(head.length - 4, 0); head.writeUInt32BE(b.magic, 4); head.writeUInt32BE(es.length, 8);
+  head.writeUInt32BE(nEbx, 12); head.writeUInt32BE(nRes, 16); head.writeUInt32BE(nChunk, 20);
+  head.writeUInt32BE(strAt, 24); head.writeUInt32BE(metaAt, 28); head.writeUInt32BE(metaSize, 32);
+  const out = [head]; let pos = head.length;
+  for (const e of es) { const a = Math.ceil(pos / 16) * 16; if (a > pos) { out.push(Buffer.alloc(a - pos)); pos = a; } out.push(e.data); pos += e.data.length; }
+  const end = Math.ceil(pos / 16) * 16; if (end > pos) out.push(Buffer.alloc(end - pos));
+  return Buffer.concat(out);
+}
+
+// A copy of bundle `buf` that also holds entries of other bundles ([{ from: parseBundle result, kind, name }]), with
+// their stored bytes, sha1 and metadata as they are there. Entries the bundle already has are not added twice.
+function addToBundle(buf, adds) {
+  const b = parseBundle(buf);
+  const has = new Set(b.entries.map((e) => e.kind + ':' + e.name.toLowerCase()));
+  let added = 0;
+  for (const a of adds) {
+    const k = a.kind + ':' + a.name.toLowerCase();
+    if (has.has(k)) continue;
+    const e = a.from.entries.find((x) => x.kind + ':' + x.name.toLowerCase() === k);
+    if (!e) throw new Error(`${a.kind} ${a.name} is not in the bundle it should be copied from`);
+    if (e.kind === 'chunk' && e.chunk.readUInt32BE(16) !== 0) throw new Error(`chunk ${e.name}: only part of it is in its bundle; cannot be copied`);
+    b.entries.push(e); has.add(k); added++;
+  }
+  return { buf: writeBundle(b), added };
 }
 
 // ============================================================ delta bundles (official patch) ===
@@ -326,20 +413,36 @@ function encodeDelta(newBuf, copies, oldMap, oldInline) {
 }
 
 // Applies replacements to a delta bundle; returns the new delta bytes (to append to the patch .sb).
-function rebuildDeltaBundle(patchSbFile, offset, size, baseSbFile, commonFile, replaceByName) {
-  return rebuildFromDelta(readDelta(patchSbFile, offset, size), baseSbFile, commonFile, replaceByName);
+function rebuildDeltaBundle(patchSbFile, offset, size, baseSbFile, commonFile, replaceByName, adds) {
+  return rebuildFromDelta(readDelta(patchSbFile, offset, size), baseSbFile, commonFile, replaceByName, adds);
 }
 
 // Same for a bundle the patch does not change (flag "base"): it is treated as a delta made of one
 // segment "whole bundle from the base .sb", so the result references the base file for unchanged data
 // and holds only the replaced entries inline.
-function rebuildBaseAsDelta(baseSbFile, offset, size, commonFile, replaceByName) {
+function rebuildBaseAsDelta(baseSbFile, offset, size, commonFile, replaceByName, adds) {
   const delta = { segs: [{ size, src: 1, off: offset }], inline: Buffer.alloc(0) };
-  return rebuildFromDelta(delta, baseSbFile, commonFile, replaceByName);
+  return rebuildFromDelta(delta, baseSbFile, commonFile, replaceByName, adds);
 }
 
-function rebuildFromDelta(delta, baseSbFile, commonFile, replaceByName) {
+function rebuildFromDelta(delta, baseSbFile, commonFile, replaceByName, adds) {
   const old = reconstructDelta(delta, baseSbFile, commonFile);
+  if (adds && adds.length) {
+    // new entries change the header and move the data: old entries are found by name in their new places
+    const grown = addToBundle(old.buf, adds).buf;
+    const oldInfo = withTempFile(old.buf, (fd) => L.readBundle(fd, 0, old.buf.length));
+    return withTempFile(grown, (fd) => {
+      const info = L.readBundle(fd, 0, grown.length);
+      const replacements = new Map();
+      info.entries.forEach((e, i) => { const r = replaceByName(e); if (r) replacements.set(i, r); });
+      const newBuf = rebuildBundle(fd, 0, grown.length, replacements);
+      const newInfo = withTempFile(newBuf, (nfd) => L.readBundle(nfd, 0, newBuf.length));
+      const oldBy = new Map(oldInfo.entries.map((e) => [e.kind + ':' + e.name, e]));
+      const copies = [];
+      info.entries.forEach((e, i) => { const o = oldBy.get(e.kind + ':' + e.name); if (o && !replacements.has(i) && e.size) copies.push({ newAt: newInfo.entries[i].pos, oldAt: o.pos, size: e.size }); });
+      return { delta: encodeDelta(newBuf, copies, old.map, delta.inline), bundle: newBuf, replaced: replacements.size, entries: info.entries };
+    });
+  }
   return withTempFile(old.buf, (fd) => {
     const info = L.readBundle(fd, 0, old.buf.length);
     if (!info) throw new Error('reconstructed delta bundle has no valid header');
@@ -356,7 +459,7 @@ function rebuildFromDelta(delta, baseSbFile, commonFile, replaceByName) {
 
 module.exports = {
   dbRead, dbWrite, child, numOf, setNum, strOf, readTocFile, encodeToc, tocChunks, tocBundles, entryId, entryFlag,
-  packBlocks, isBlockFramed, appendToSb, rebuildBundle, bundleLayout,
+  packBlocks, packChunk, isBlockFramed, appendToSb, rebuildBundle, bundleLayout, parseBundle, writeBundle, addToBundle,
   readDelta, reconstructDelta, encodeDelta, rebuildDeltaBundle, rebuildBaseAsDelta, withTempFile, DELTA_MAGIC,
 };
 

@@ -218,7 +218,11 @@ function templatedVertex(section, values, pool = section.vertices) {
   // nearest by position; normal and UV break ties (vertices on a UV seam share a position), so an unchanged vertex
   // finds exactly itself
   const sq = (a, b, n) => { if (!a || !b) return 0; let s = 0; for (let k = 0; k < n; k++) s += (a[k] - b[k]) ** 2; return s; };
-  const score = (v) => sq(v.position || [0, 0, 0], values.position, 3) + 1e-4 * (sq(v.normal, values.normal, 3) + sq(v.uv0, values.uv0, 2) + sq(v.uv1, values.uv1, 2)); // sq() skips missing fields
+  // a new point without its own uv1 (a model from elsewhere) takes the uv1 of the template: then the template must face
+  // the same way, or a point at the edge of the roof takes the mask place of the side (the mask has the top and the
+  // sides as separate islands, and a triangle stretched between two islands shows stripes and teeth)
+  const nw = values.uv1 ? 1e-4 : 0.05;
+  const score = (v) => sq(v.position || [0, 0, 0], values.position, 3) + nw * sq(v.normal, values.normal, 3) + 1e-4 * (sq(v.uv0, values.uv0, 2) + sq(v.uv1, values.uv1, 2)); // sq() skips missing fields
   const ix = poolIndex(pool);
   // 1) exactly the same vertex (unchanged geometry): instant
   const key = vertexKey(values, ix.fields), twins = ix.exact.get(key);
@@ -623,6 +627,25 @@ function glbToModel(index, mesh, glbBuf, opts = {}) {
         const light = shades[Math.floor(shades.length * 0.9)];
         for (const v of verts) v.raw.writeUInt32LE(light, colEl.offset);
       }
+      // uv1 taken from templates: a triangle whose corners still landed on different islands of the mask gets one place
+      // for all its corners (copies of the odd corners), so it shows that place evenly instead of stripes
+      let evened = 0;
+      if (prims.every((pr) => !pr.uv1) && verts.some((v) => v.uv1)) {
+        const far = (a, b) => Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) > 0.06;
+        const copies = new Map();
+        for (const t of tris) {
+          const u = t.map((i) => verts[i].uv1);
+          if (!u[0] || !u[1] || !u[2] || (!far(u[0], u[1]) && !far(u[1], u[2]) && !far(u[0], u[2]))) continue;
+          const m = !far(u[0], u[1]) || !far(u[0], u[2]) ? 0 : !far(u[1], u[2]) ? 1 : 0; // a corner that agrees with another
+          for (let k = 0; k < 3; k++) {
+            if (!far(u[k], u[m])) continue;
+            const key = t[k] + '|' + t[m];
+            if (!copies.has(key)) { verts.push({ ...verts[t[k]], raw: Buffer.from(verts[t[k]].raw), uv1: u[m].slice() }); copies.set(key, verts.length - 1); }
+            t[k] = copies.get(key);
+          }
+          evened++;
+        }
+      }
       // one bone per triangle: a triangle whose corners took their bytes from vertices of different bones (body and
       // bumper, ...) would stretch when the parts move apart. Its odd corners get a copy on the triangle's main bone.
       const boneEl = s.elements.find((e) => e.usage === 2);
@@ -644,7 +667,7 @@ function glbToModel(index, mesh, glbBuf, opts = {}) {
           split++;
         }
       }
-      report.push(`LOD ${li} ${s.material}: ${s.vertices.length} -> ${verts.length} vertices, ${s.triangles.length} -> ${tris.length} triangles${split ? ` (${split} triangles put on one bone)` : ''}`);
+      report.push(`LOD ${li} ${s.material}: ${s.vertices.length} -> ${verts.length} vertices, ${s.triangles.length} -> ${tris.length} triangles${split ? ` (${split} triangles put on one bone)` : ''}${evened ? ` (${evened} evened on the mask)` : ''}`);
       s.vertices = verts; s.triangles = tris;
     }
     const keep = new Set(opts.keepParts || []); // parts kept as they are even with clearOthers (e.g. DRIVER)

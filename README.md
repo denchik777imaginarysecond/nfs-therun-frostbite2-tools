@@ -142,6 +142,7 @@ A mod is a folder (or a ZIP renamed to `.nfsmod`) with a `mod.json` and optional
 | `texture` | Replaces a texture with a PNG. The texture keeps its format (DXT1, DXT3, DXT5, BC4, BC5, DXT5 normal maps, L8, BGRA8) and, by default, its size. `"size": "png"` uses the picture's own size, `"size": [w, h]` any other (powers of two, 4 to 4096); the header and mip levels are rebuilt. |
 | `mesh` | Replaces a 3D model with a `.glb` (export it with `fb2_mesh.js model`, edit it in Blender, export as glTF binary). Objects `lod0`, `lod1`, … replace those levels of detail; levels without an object get `lod0`'s (`"keepOtherLods": true` keeps the originals). Parts are matched by material name. New vertices take the game-specific data (bone, damage, colour) of the nearest original vertex, so the car still deforms in crashes; a triangle never mixes two bones (no stretched slivers when parts move). `"clearOthers": true` hides the parts the `.glb` does not have (except `"keepParts": [names]`), `"hide": true` (no `.glb`) hides the whole model, `"evenShade": true` gives new geometry an even light baked shade instead of the old shape's. |
 | `text` | Changes a text the player sees (menu items, car names, hints, subtitles), any length. `id` is the 8-digit text id (find it with `node fb2_loc.js --game "<game dir>" find <words>` or in the editor's Texts tab). Without `"lang"` it changes every installed language. Characters missing from the game's font may not show up. |
+| `add` | `{ "type": "add", "next": "<ebx name>", "add": ["<asset name>", …] }` copies those assets (the ebx, the res of the same name and the chunks that res uses) from a bundle that has them into every bundle that holds `next`. The game loads only the bundles it needs, so an ebx can only refer to assets in a bundle that is loaded with it. Example: a plain colour (a livery without a picture) gets a vinyl picture (see "Car liveries"). Copies get the mod's version of the asset when another change replaces it. |
 | `file` | Replaces a whole ebx/res/chunk with a file from the mod (advanced; avoid shipping original game data). |
 
 Find assets and values with `node fb2_extract.js --game "<game dir>" find <word>` and `node fb2_ebx_edit.js --game "<game dir>" show <ebx>`.
@@ -156,6 +157,8 @@ node fb2_mods.js pack my-mod                  # -> my-mod-1.0.0.nfsmod to share
 
 Mods are applied in load order (`list`); when two mods set the same value, the later one wins and `check`/`apply` report the conflict. `apply` builds all enabled mods together into one update package, `<game>\Update\Mods`: a copy of the official patch (about 45 MB) with the changes added and a version number one above the patch, so the game loads it instead of `Update\Patch`. The original game files are never written. Bundles that the patch takes from the base game are added to the package as delta bundles that reference the base `.sb`, so only changed data is stored. Not supported yet: assets in superbundles that the official patch does not touch (audio, terrain, CommonAssets, Globals).
 
+Building models and textures takes up to a second each, so `apply` keeps the results in `output/cache`. The key covers everything a result depends on: the change, the bytes of the mod's `.glb`/`.png`, the game's asset index and the code that builds it. Running `apply` again with nothing changed takes a few seconds (the package is left as it is). Switching a mod on or off reuses the cached models. Entries not used for 30 days are removed.
+
 ### Modding (low level)
 
 `fb2_patch.js` applies mods from a `mods/` folder. Mod files hold the **unpacked** asset data:
@@ -164,6 +167,8 @@ Mods are applied in load order (`list`); when two mods set the same value, the l
 mods/chunk/<32-hex guid>.chunk        replaces a chunk (toc chunk list or bundle)
 mods/ebx/<asset path>.ebx             replaces an ebx in every bundle that contains it
 mods/res/<asset path>.res             replaces a res in every bundle that contains it
+mods/adds/<any>.json                  { "next": "<ebx>", "add": ["<asset>", ...] }: copies assets into the bundles of "next"
+mods/chunk/<guid>.chunk.json          { "logicalOffset": n }: hint for bundles that hold only the tail of a texture
 ```
 
 Ways to make mods:
@@ -214,6 +219,26 @@ inline data
 ```
 
 The bundle is all segments concatenated in order. Source `0` = the next bytes of the inline data, `1` = the base game `.sb` at the absolute offset, `-1` = `Update/Patch/Data/common.dat` at the absolute offset. All 372 delta bundles of the game rebuild with every entry matching its header sha1, and re-encoding them without changes gives identical bundles.
+
+### Bundle header
+
+All numbers are big-endian; offsets marked * are counted from byte 4.
+
+```
+0x00 header size (from byte 4)   0x04 magic 0x970D1C13     0x08 entry count
+0x0C ebx count    0x10 res count    0x14 chunk count      0x18 names at*    0x1C chunkMeta at*    0x20 chunkMeta size
+0x24 sha1 of every entry's STORED bytes (20 each; ebx, then res, then chunks)
+     ebx + res: [name at, stored size, unpacked size] (12 each)
+     res types (4 each), res meta (16 each)
+     chunks: [GUID 16 (first three fields byte-swapped), A, B, C] (28 each)
+     chunkMeta: a DbObject list, one item per chunk: { h32, meta { firstMip } }
+     names (zero-terminated; an ebx and a res with the same name share one)
+     padding to 16, then the data of every entry, each 16-byte aligned
+```
+
+- A chunk entry with `A = 0` holds the whole chunk (stored size `B`). With `A > 0` it holds only the tail (a texture without the levels streamed later): `A` = where the tail starts in the packed full chunk, `B` = packed full size, `C` = logical offset of the tail. The packed chunk must have a block border at `C`.
+- `fb2_repack.js` reads and writes the whole header (`parseBundle` / `writeBundle`). Rebuilding all 3,799 bundles of the vehicle and UI superbundles without changes gives identical bytes. `addToBundle` adds entries of other bundles (stored bytes, sha1 and metadata as they are).
+- Small livery bundles (`_c4/blueprint/liverybundles/bb_<car>_<livery>`) hold one livery, and its picture when it has one. The game's own liveries always keep their picture in their own bundle; the `add` change does the same for liveries that get a picture. This works in the game.
 
 ### EBX layout (NFS The Run)
 
@@ -275,6 +300,10 @@ section  +0x08 material name   +0x14 triangles   +0x18 first index   +0x1C verte
 - **Vertex data** (half floats): position (usage 1), normal (6), tangent (7), uv0 (0x21), uv1 (0x22), bone index (2, four equal bytes: rigid parts), vertex colour (0x1E), damage cell (0xF1), a constant 1.0 (0xF2), binormal sign (9).
 - **Cars:** every part is a model `<car>/kits/<car>_kit00_stream_mesh<part>` (body, bumpers, doors, hood, …); other body kits (`kit01v`, `kit03v`) and hood/exhaust variants are separate models. Wheel positions come from `RaceWheelComponentData.Transform` in the kit ebx. Traffic cars, brake discs and calipers keep their wheels as bone groups at the origin. The damage res (`11f603c1`) does not refer to vertices, so models can get new vertices.
 - `fb2_mesh.js selftest` reads and rewrites every model of the game byte-for-byte; a `.glb` export imported back unchanged gives identical models.
+- **At most 65,536 vertices per section** (16-bit indices). A detailed model has to be spread over several sections or simplified.
+- **uv1 is a mask layout**, not a second texture layout: car paint samples `<car>_mask` (128×128: dirt, damage and shading in R/G/B) with it. The roof and the sides are separate islands with black gaps between them. A new vertex without its own uv1 takes the uv1 of the nearest original vertex **facing the same way**. A triangle whose corners still land on different islands gets one place for all its corners. Otherwise it stretches across a gap and shows zigzags and dark stripes, the same in races and in the garage.
+- **Section names differ between body kits**: the spare chrome part is `CHROME_LEFT` in `kit00`, `CHROME_TOP` in `kit01v`, `CHROME_RIGHT` in `kit03v`. Match sections by family (`CHROME_*`), not only by exact name.
+- **Left and right:** a glTF car facing +z has its left side at +x, and so does the game (the driver and the `LEFT` light markers of a left-hand-drive car are at +x). Models exported from the game come back the same way. A model from elsewhere must be mirrored once on import, or text on it reads backwards.
 
 ### Car liveries and body colour
 
@@ -287,6 +316,13 @@ A livery is an ebx `<car>/liveries/<car>_<name>` (`NfsVehicleLiveryData`):
 Verified in the game: a blue `paintColor` with a transparent vinyl holding a white centre stripe and squares placed by uv0 on the doors.
 
 The **garage** does not use that picture. It builds its preview from vinyl templates (`vinyls/<car>_<name>`, `NfsVinylTemplateAsset` → `textures/vinyls/<car>/<name>`, `NfsVinylTextureAsset`): a stack of layers, each a 512×512 L8 mask `<name>_<n>_win32` plus a fill colour (`Effects[0].Color0`, picture colour / 255). The masks are inverted (black = the layer is here), the last layer is on top, and the garage lays the result by uv0 **upside down**. All of this was confirmed in the game with coloured test bands.
+
+More about liveries, all confirmed in the game:
+
+- **Where no layer is, the garage shows the body colour** (`paintColor`). So the background of a picture needs no layer: set it as the body colour and give every layer to the decals. A template with a single layer can still show black lettering on orange paint.
+- **A template can hold several items** (`NfsVinylTemplateItem`: Texture, Translation, Scale, Rotation, FlipHorizontal/Vertical). Some cars have one item over the whole body. Others add small, rotated or mirrored copies at the sides. A full-body picture placed into a small item shows as stray zigzags. Keep one item at `Translation 0.5, 0.5`, `Scale 1, 1` and remove the others from `Vinyls`.
+- **Some vinyl textures are shared** between cars' templates (logos, NFS editions). Change only the ones a single car uses.
+- **Plain colours have no picture**: about half of a car's liveries (`pp_stock_*` and others) have `VinylTexture` = null, and their bundle has no picture. Each body kit offers its own set of colours, so with a new model "some colours show the livery, others do not". To give them the picture: set `VinylTexture` to `{ "ref": "<a vinyl texture>" }`, copy the `Car_Vinyl` paint settings of a livery that has a picture (`VinylSmoothness`, `VinylSpecular`, …), and copy the picture into the colour's bundle with an `add` change.
 
 ### Porting a car model (fb2_carport.js)
 
@@ -306,6 +342,39 @@ node fb2_mods.js install my_ports/<name>/mod
 - **Lights**: flare and light markers are moved onto the model's lamps (`"lights"`).
 - **All paint jobs** of the car are replaced: race liveries (the model's paint picture by uv0, 2048), garage templates (the picture split into the layer colours) and body colours. The paint material is found by name, or it is the material covering most of the body.
 - **Wheels** (`"wheel": true`): one front and one rear wheel cut out and moved to the origin like the game's wheel models.
+- **Size limits**: triangles are counted per section while they are handed out. A full section (55,000 vertices, leaving room for the copies the importer adds) passes the rest to the rule's `"spill"` sections of the same part, and then to the nearest part with room.
+
+**Automatic mode.** Players do not have to write `port.json`. Option **C** in `manage_mods.bat` asks for a `.glb` and a car, then builds and installs the mod. The same from the command line:
+
+```bash
+node fb2_carport.js --game "<game dir>" auto my_ports/<name>/model.glb <car id>   # writes port.json, then the mod
+```
+
+It works out:
+- **The size**: from the wheelbase when the model has tyres (models come in metres, centimetres, inches, feet and odd units), otherwise from the length.
+- **Which end is the front**: from headlight names, red/rear lamps, or the cabin glass.
+- **What every piece is**, from object and material names, transparency, colour and place:
+  - paint: the biggest surface named like paint;
+  - trim, underbody (`CHASSIS`), glass, lamps, red lenses, interior;
+  - tyres at the four corners, rims and unnamed wheel faces inside them;
+  - brakes and decals left out.
+
+It prints a list by category and `CHECK:` lines for anything it was not sure about. A `port.json` it wrote can be edited and run again.
+
+Tested models (Sketchfab, kept out of this repository):
+
+| Model | Game car | Triangles | Result |
+|---|---|---|---|
+| BMW M3 GTR (Most Wanted) | Chevrolet Camaro SS 1967 | ~80k | works in the game: body, crashes, glass, lights, interior, livery in races and garage (hand-written `port.json`) |
+| Nissan Skyline R34 (Underground) | Nissan Skyline GT-R R32 | ~80k | works in the game with `auto`, wheels included; decals on every colour and body kit |
+| Ford Mustang "Hoonicorn" | Ford Mustang Boss 302 1969 | 313k | builds with `auto` (odd units, 200k triangles of trim spread over the car); **not checked in the game** |
+
+**Ideas for whoever continues:**
+- Decals made as separate geometry over the paint (the Hoonicorn's stickers) are dropped or become trim. They could be baked into the livery picture by projecting each sticker triangle onto the nearest paint surface's uv0.
+- A model too heavy even with spilling could be simplified automatically (quadric edge collapse) down to the section limit.
+- Interiors with tiled UVs come out flat (the atlas keeps one tile).
+- The model goes into every level of detail, so many cars with very heavy models may cost frame rate.
+- Hoods and doors are taken by nearest original vertex (`"near"`). A model whose hood is very different (an engine through it) ends up with the hood in the body, so it does not come off in crashes.
 
 Do not publish models taken from other games: share the `port.json`, and let every player use their own copy of the model. The `my_ports/` folder is ignored by git for this reason.
 
@@ -317,7 +386,7 @@ Do not publish models taken from other games: share the `port.json`, and let eve
 | `install_mod.bat`, `manage_mods.bat`, `apply_mods.bat`, `restore_game.bat` | Install a dropped `.nfsmod`, apply enabled mods, restore the original game (ask for administrator rights) |
 | `editor.bat`, `fb2_editor.js`, `editor/index.html` | Asset browser and value editor in the web browser; saves `.nfsmod` mods |
 | `fb2_game.js` | Finds the game folder: registry, usual folders, or a folder picker; remembered in `game_path.txt` (a `--game` option is used once and not remembered) |
-| `fb2_mods.js` | Mod manager: `.nfsmod` format, install/enable/disable/remove, conflict check, apply, pack |
+| `fb2_mods.js` | Mod manager: `.nfsmod` format, install/enable/disable/remove, conflict check, apply (with a build cache), pack, car model porting from the menu |
 | `fb2_zip.js` | Minimal ZIP reader/writer for `.nfsmod` |
 | `examples/DeveloperMenu` | The developer menu unlock as a mod |
 | `fb2_devmenu.js` | The logic behind them: switches the DeveloperMenu mod on/off through the mod manager |
@@ -332,8 +401,8 @@ Do not publish models taken from other games: share the `port.json`, and let eve
 | `fb2_texture.js` | Texture header parser and decoder for every format the game uses (DXT1/3/5, BC4, BC5, L8, BGRA8, …), writes PNG |
 | `fb2_tex_import.js` | PNG to texture import for the same formats: any size, mip levels, new header; `selftest` checks the header rules on every texture |
 | `fb2_mesh.js` | 3D models: MeshSet reader/writer, `.glb` export (one model or a whole car) and import (new vertices, all LODs, bounding box); `selftest` checks every model |
-| `fb2_carport.js` | Ports a whole car model from a `.glb` onto a car of the game (parts, bones, glass, lights, textures, all paint jobs, wheels) and writes a mod |
-| `fb2_repack.js` | Write support: lossless DbObject/TOC writer, zlib block packer, `.sb` append, bundle rebuild, delta bundles, self-test |
+| `fb2_carport.js` | Ports a whole car model from a `.glb` onto a car of the game (parts, bones, glass, lights, textures, all paint jobs, wheels) and writes a mod; `auto` writes the `port.json` itself |
+| `fb2_repack.js` | Write support: lossless DbObject/TOC writer, zlib block packer, `.sb` append, bundle header reader/writer, bundle rebuild, adding assets to a bundle, delta bundles, self-test |
 | `fb2_patch.js` | Mod loader: `apply --package <dir>` builds the `Update\Mods` package; the older in-place mode (`apply`/`restore` with backups) is kept for migration and research |
 
 Notes on the format, as found in this game: EBX header fields are 32-bit (unlike Battlefield 3). On PC, ebx instances are `[GUID][data]` packed with at most 4-byte alignment. Chunk GUIDs in bundle tables have their first three fields byte-swapped. Video and audio chunks are stored uncompressed.
