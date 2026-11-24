@@ -415,6 +415,24 @@ Notes on the format, as found in this game: EBX header fields are 32-bit (unlike
 - **Demo and E3 leftovers**: demo menus, Japanese demo screens, `e3_pause`, the "demo expired" screen.
 - Working names of shipped tracks: `deathvalley`, `panamintsprings`, `zioncanyon`, `yosemitenorth`.
 
+## Thanks and related work
+
+This project builds on what others found before it, and it is not the only place where The Run is modded:
+
+- **Frostbite 2 research from the Battlefield 3 era** (Frankelstner's dump scripts and the community around them): TOC decryption, DbObject, bundles and ebx were first worked out there.
+- **NicknineTheEagle**: Frostbite scripts that dump the files of Frostbite 2 games, The Run included.
+- **379Felipe**: a model dumper for the game.
+- **[mRally2 — The Run Tools & Research](https://github.com/mRally2/The-Run-Tools-Research)**: the community hub for this game, with tools, research files, EBX dumps and many mods (car rosters, liveries, Drift Attack, unreleased events, a debug menu mod).
+- **[The Cutting Room Floor](https://tcrf.net/Need_for_Speed:_The_Run)**: documented the hidden DEBUG menu first.
+- **[BadassBaboon — NFS The Run Definitive Edition](https://github.com/BadassBaboon/NFS-TheRun-DE)** and **ThirteenAG — Fusion Fix**: fixes for modern PCs (frame rate and more).
+
+What this project adds is the **write** side, as tools for players:
+- mods in a separate update package, without touching the game files;
+- a full ebx writer, bundle and delta bundle writers;
+- importing models back with their damage and bones;
+- the livery system;
+- porting whole cars.
+
 ## Author
 
 Made by **denchik777** (GitHub [denchik777imaginarysecond](https://github.com/denchik777imaginarysecond), Reddit u/Imaginary-Second9581): the research, the file format work, the mod system and the editor. The findings were first published on Reddit.
